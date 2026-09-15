@@ -14,3 +14,5 @@ graphify-out/
 cicle_gpx/
 .vscode/settings.json
 notebooks/data/stadtradeln_konstanz/
+notebooks/data/osm/
+outputs/
