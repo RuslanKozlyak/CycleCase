@@ -1,4 +1,3 @@
-import geopandas as gpd
 import networkx as nx
 import pandas as pd
 from shapely.geometry import LineString
@@ -29,11 +28,9 @@ def test_association_rewards_route_on_popular_edges():
         "algorithm": ["busy", "quiet"],
         "edge_route": [[(1, 2, 0), (2, 4, 0)], [(1, 3, 0), (3, 4, 0)]],
     })
-    result = route_edge_association(routes, features, "stad_trips", popular_threshold=50)
-    assert result.loc["busy", "corr_selected_vs_log_popularity"] > 0.99
-    assert result.loc["quiet", "corr_selected_vs_log_popularity"] < -0.99
-    assert result.loc["busy", "popular_length_share"] == 1.0
-    assert result.loc["corridor (all edges)", "popular_length_share"] == 0.5
+    result = route_edge_association(routes, features, "stad_trips")
+    assert result["busy"] > 0.99
+    assert result["quiet"] < -0.99
 
     composition = composition_table(route_edges_long(routes, features), features, "road_class")
     assert composition.loc["busy", "велодорожка"] == 100

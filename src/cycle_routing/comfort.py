@@ -14,6 +14,9 @@ from .config import DEFAULT_COMFORT_CONFIG
 from .tags import first_number, tag_values
 
 
+LANES_PENALTY_FROM = 3
+NARROW_WIDTH_M = 2.0
+MIN_LENGTH_M = 0.1
 CYCLEWAY_KEYS = ("cycleway", "cycleway:left", "cycleway:right", "cycleway:both")
 MAJOR_HIGHWAYS = {"motorway", "trunk", "primary", "secondary"}
 FOOT_HIGHWAYS = {"footway", "pedestrian", "steps", "corridor"}
@@ -62,9 +65,11 @@ def _edge_tags(data: Mapping[str, object]) -> dict:
         "surfaces": tag_values(data.get("surface")),
         "bicycle": bicycle,
         "has_cycleway": bool(cycle_tags - {"no", "none", "separate"}) or "cycleway" in highways,
-        "footway_without_bicycle": "footway" in highways and not bicycle & {"yes", "designated", "permissive"},
+        "smoothness": tag_values(data.get("smoothness")),
+        "service": tag_values(data.get("service")),
         "maxspeed_kmh": first_number(data.get("maxspeed")),
         "lanes": first_number(data.get("lanes")),
+        "width_m": first_number(data.get("width")),
         "unlit": "no" in tag_values(data.get("lit")),
     }
 
@@ -90,18 +95,19 @@ def _comfort_factors(tags: dict, cfg: Mapping[str, object]) -> dict[str, float]:
             if tags["has_cycleway"] and "cycleway" not in tags["highways"]
             else 1.0
         ),
-        "footway_mult": mult["footway_without_bicycle"] if tags["footway_without_bicycle"] else 1.0,
+        "bicycle_factor": max((cfg["bicycle"].get(value, 1.0) for value in tags["bicycle"]), default=1.0),
+        "smoothness_factor": max((cfg["smoothness"].get(value, 1.0) for value in tags["smoothness"]), default=1.0),
+        "service_factor": max((cfg["service"].get(value, 1.0) for value in tags["service"]), default=1.0),
         "maxspeed_mult": 1.0 + speed_extra,
-        "lanes_mult": (
-            mult["many_lanes"] if tags["lanes"] and tags["lanes"] >= cfg["lanes_penalty_from"] else 1.0
-        ),
+        "lanes_mult": mult["many_lanes"] if tags["lanes"] and tags["lanes"] >= LANES_PENALTY_FROM else 1.0,
+        "width_mult": mult["narrow"] if tags["width_m"] and tags["width_m"] < NARROW_WIDTH_M else 1.0,
         "lit_mult": mult["unlit"] if tags["unlit"] else 1.0,
     }
 
 
 def _factor_and_cost(data: Mapping[str, object], factors: dict[str, float], cfg) -> tuple[float, float]:
     comfort_factor = max(float(math.prod(factors.values())), cfg["min_factor"])
-    length = max(float(data.get("length", 1.0)), cfg["min_length_m"])
+    length = max(float(data.get("length", 1.0)), MIN_LENGTH_M)
     return comfort_factor, length * comfort_factor
 
 
@@ -118,9 +124,12 @@ def comfort_components(data: Mapping[str, object], config: Mapping[str, object] 
         "surface": ";".join(sorted(tags["surfaces"])) or None,
         "surface_class": surface_class(tags["surfaces"]),
         "has_cycleway": tags["has_cycleway"],
-        "footway_without_bicycle": bool(tags["footway_without_bicycle"]),
+        "bicycle": ";".join(sorted(tags["bicycle"])) or None,
+        "smoothness": ";".join(sorted(tags["smoothness"])) or None,
+        "service": ";".join(sorted(tags["service"])) or None,
         "maxspeed_kmh": tags["maxspeed_kmh"],
         "lanes": tags["lanes"],
+        "width_m": tags["width_m"],
         "unlit": tags["unlit"],
         "length_m": float(data.get("length", 0.0)),
         **factors,

@@ -1,8 +1,12 @@
-"""Shortest/comfort route construction helpers."""
+"""Stage 4 - routing algorithm: shortest and turn-aware comfort routes for every preset."""
 
 from __future__ import annotations
 
+from dataclasses import asdict
+import hashlib
 from itertools import count
+import json
+from pathlib import Path
 import heapq
 import math
 
@@ -10,8 +14,11 @@ import networkx as nx
 import geopandas as gpd
 import numpy as np
 import osmnx as ox
+import pandas as pd
+import shapely
 from shapely.geometry import LineString
 from shapely.ops import linemerge
+from tqdm.auto import tqdm
 
 from .comfort import add_comfort_cost
 from .config import TurnConfig
@@ -40,11 +47,14 @@ def _bearing(start: tuple[float, float], end: tuple[float, float]) -> float:
     return math.degrees(math.atan2(dx, dy)) % 360
 
 
-def _turn_kind(graph, incoming: EdgeKey, outgoing: EdgeKey, config: TurnConfig) -> str:
-    incoming_coordinates = _oriented_coordinates(graph, incoming)
-    outgoing_coordinates = _oriented_coordinates(graph, outgoing)
-    incoming_bearing = _bearing(incoming_coordinates[-2], incoming_coordinates[-1])
-    outgoing_bearing = _bearing(outgoing_coordinates[0], outgoing_coordinates[1])
+def _edge_bearings(graph, edge: EdgeKey) -> tuple[float, float]:
+    """Travel bearing when entering and when leaving the edge."""
+
+    coordinates = _oriented_coordinates(graph, edge)
+    return _bearing(coordinates[0], coordinates[1]), _bearing(coordinates[-2], coordinates[-1])
+
+
+def _turn_kind(incoming_bearing: float, outgoing_bearing: float, config: TurnConfig) -> str:
     difference = (outgoing_bearing - incoming_bearing + 180) % 360 - 180
     absolute = abs(difference)
     if absolute <= config.straight_angle_max_deg:
@@ -57,15 +67,27 @@ def _turn_kind(graph, incoming: EdgeKey, outgoing: EdgeKey, config: TurnConfig) 
     return "right" if difference > 0 else "left"
 
 
-def shortest_edge_path_with_turns(
-    graph,
-    origin: int,
-    destination: int,
-    *,
-    weight: str = "comfort_cost",
-    turn_config: TurnConfig,
-) -> tuple[list[EdgeKey], float, float] | None:
-    """Dijkstra whose state includes the exact incoming directed edge."""
+# A search algorithm is any function
+#     search(graph, origin, destination, weight, turns) -> list[EdgeKey] | None
+# returning the directed edges of the cheapest route by edge attribute ``weight`` ("length" or
+# "comfort_cost"); ``turns`` is the preset's TurnConfig or None. Give a preset {"search": fn} to swap it.
+
+
+def dijkstra(graph, origin: int, destination: int, weight: str, turns: TurnConfig | None = None) -> list[EdgeKey] | None:
+    """NetworkX Dijkstra over nodes; ignores turn penalties, takes the cheapest parallel edge."""
+
+    try:
+        nodes = nx.shortest_path(graph, origin, destination, weight=weight)
+    except nx.NetworkXNoPath:
+        return None
+    return [
+        (u, v, min(graph[u][v], key=lambda key: graph[u][v][key].get(weight, math.inf)))
+        for u, v in zip(nodes, nodes[1:])
+    ] or None
+
+
+def dijkstra_turns(graph, origin: int, destination: int, weight: str, turns: TurnConfig) -> list[EdgeKey] | None:
+    """Dijkstra whose state is the incoming directed edge, so every turn adds its penalty."""
 
     start = (origin, None)
     distances = {start: 0.0}
@@ -73,6 +95,12 @@ def shortest_edge_path_with_turns(
     sequence = count()
     queue = [(0.0, next(sequence), start)]
     target = None
+    bearings: dict[EdgeKey, tuple[float, float]] = {}
+
+    def edge_bearings(edge: EdgeKey) -> tuple[float, float]:
+        if edge not in bearings:
+            bearings[edge] = _edge_bearings(graph, edge)
+        return bearings[edge]
 
     while queue:
         cost, _, state = heapq.heappop(queue)
@@ -84,46 +112,23 @@ def shortest_edge_path_with_turns(
             break
         for _, neighbour, key, data in graph.out_edges(node, keys=True, data=True):
             outgoing = (node, neighbour, key)
-            edge_cost = float(data.get(weight, data.get("length", 1.0)))
-            turn_penalty = (
-                turn_config.penalty(
-                    _turn_kind(graph, incoming, outgoing, turn_config)
-                )
-                if incoming is not None
-                else 0.0
-            )
-            new_cost = cost + edge_cost + turn_penalty
+            new_cost = cost + float(data.get(weight, data.get("length", 1.0)))
+            if incoming is not None:
+                new_cost += turns.penalty(_turn_kind(edge_bearings(incoming)[1], edge_bearings(outgoing)[0], turns))
             new_state = (neighbour, outgoing)
             if new_cost < distances.get(new_state, math.inf):
                 distances[new_state] = new_cost
-                previous[new_state] = (state, outgoing, turn_penalty)
+                previous[new_state] = (state, outgoing)
                 heapq.heappush(queue, (new_cost, next(sequence), new_state))
 
-    if target is None:
+    if target is None or target == start:
         return None
-
     edges = []
-    total_turn_penalty = 0.0
     state = target
     while state != start:
-        state, edge, penalty = previous[state]
+        state, edge = previous[state]
         edges.append(edge)
-        total_turn_penalty += penalty
-    edges.reverse()
-    return edges, distances[target], total_turn_penalty
-
-
-def _edges_to_gdf(graph, edges: list[EdgeKey]) -> gpd.GeoDataFrame:
-    rows = []
-    for u, v, key in edges:
-        data = dict(graph.edges[u, v, key])
-        data.update({"u": u, "v": v, "key": key})
-        if data.get("geometry") is None:
-            data["geometry"] = LineString(
-                [(graph.nodes[u]["x"], graph.nodes[u]["y"]), (graph.nodes[v]["x"], graph.nodes[v]["y"])]
-            )
-        rows.append(data)
-    return gpd.GeoDataFrame(rows, geometry="geometry", crs=graph.graph["crs"])
+    return edges[::-1]
 
 
 def route_record(
@@ -134,32 +139,17 @@ def route_record(
     od_id: str,
     *,
     turn_config: TurnConfig | None = None,
+    search=None,
 ):
-    weight = "length" if algorithm == "shortest" else "comfort_cost"
-    use_turns = algorithm != "shortest" and turn_config is not None and turn_config.enabled
-    if use_turns:
-        result = shortest_edge_path_with_turns(
-            graph,
-            origin,
-            destination,
-            weight=weight,
-            turn_config=turn_config,
-        )
-        if result is None:
-            return None
-        edge_route, objective_cost, turn_penalty_total = result
-        route = [origin, *(edge[1] for edge in edge_route)]
-        edges = _edges_to_gdf(graph, edge_route)
-    else:
-        route = ox.routing.shortest_path(graph, origin, destination, weight=weight)
-        if route is None or len(route) < 2:
-            return None
-        edges = ox.routing.route_to_gdf(graph, route, weight=weight)
-        edge_route = list(edges.index)
-        objective_cost = float(edges[weight].sum())
-        turn_penalty_total = 0.0
+    """One route as a dict; ``search`` defaults to ``dijkstra_turns`` with turn penalties, else ``dijkstra``."""
 
-    geometry = edges.geometry.union_all()
+    search = search or (dijkstra_turns if turn_config is not None else dijkstra)
+    weight = "length" if algorithm == "shortest" else "comfort_cost"
+    edge_route = search(graph, origin, destination, weight, turn_config)
+    if not edge_route:
+        return None
+    lines = [LineString(_oriented_coordinates(graph, edge)) for edge in edge_route]
+    geometry = shapely.union_all(lines)
     if geometry.geom_type == "MultiLineString":
         merged = linemerge(geometry)
         if not merged.is_empty:
@@ -167,14 +157,21 @@ def route_record(
     return {
         "od_id": od_id,
         "algorithm": algorithm,
-        "route": route,
         "edge_route": edge_route,
-        "route_length_m": float(edges["length"].sum()),
-        "objective_cost": objective_cost,
-        "turn_penalty_total_m": turn_penalty_total,
-        "route_stad_trips_mean": float(edges["stad_trips"].mean()) if "stad_trips" in edges else np.nan,
+        "route_length_m": float(sum(graph.edges[edge]["length"] for edge in edge_route)),
+        "turns": count_turns(graph, edge_route),
         "geometry": geometry,
     }
+
+
+def count_turns(graph, edge_route: list[EdgeKey], config: TurnConfig = TurnConfig()) -> int:
+    """Left, right and U-turns along the route; slight bends do not count."""
+
+    bearings = [_edge_bearings(graph, tuple(edge)) for edge in edge_route]
+    return sum(
+        _turn_kind(incoming[1], outgoing[0], config) in {"left", "right", "u_turn"}
+        for incoming, outgoing in zip(bearings, bearings[1:])
+    )
 
 
 def sample_od_pairs(
@@ -206,43 +203,49 @@ def sample_od_pairs(
     raise RuntimeError(f"Only {len(pairs)} OD pairs found")
 
 
-def build_routes(
-    graph,
-    pairs,
-    *,
-    turn_config: TurnConfig | None = None,
-    comfort_configs=None,
-) -> gpd.GeoDataFrame:
-    """Build a shortest route and one or more named comfort candidates."""
-
-    pairs = list(pairs)
+def _preset_routes(graph, pairs, algorithm, config, turns, search, cache_dir: Path | None) -> pd.DataFrame:
+    path = None
+    if cache_dir is not None:
+        # ponytail: the graph is identified by its size only; clear cache_dir after re-downloading OSM.
+        key = json.dumps({
+            "graph": [graph.number_of_nodes(), graph.number_of_edges(), str(graph.graph["crs"])],
+            "pairs": [[od_id, int(origin), int(destination)] for od_id, origin, destination in pairs],
+            "config": config,
+            "turns": asdict(turns) if turns is not None else None,
+            "search": getattr(search, "__name__", None),
+        }, sort_keys=True)
+        path = Path(cache_dir) / f"{algorithm}_{hashlib.sha256(key.encode()).hexdigest()[:12]}.pkl"
+        if path.exists():
+            return pd.read_pickle(path)
+    if config is not None:
+        add_comfort_cost(graph, config)
     records = [
-        route_record(graph, origin, destination, "shortest", od_id)
+        route_record(graph, origin, destination, algorithm, od_id, turn_config=turns, search=search)
         for od_id, origin, destination in pairs
     ]
-    if comfort_configs is None:
-        comfort_configs = {"comfort": None}
-    for algorithm, config in comfort_configs.items():
-        if algorithm == "shortest":
-            raise ValueError("'shortest' is reserved for the physical-length baseline")
-        if config is not None:
-            add_comfort_cost(graph, config)
-        records.extend(
-            route_record(
-                graph,
-                origin,
-                destination,
-                algorithm,
-                od_id,
-                turn_config=turn_config,
-            )
-            for od_id, origin, destination in pairs
-        )
-    return gpd.GeoDataFrame(
-        [record for record in records if record is not None],
-        geometry="geometry",
-        crs=graph.graph["crs"],
-    )
+    frame = pd.DataFrame([record for record in records if record is not None])
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_pickle(path)
+    return frame
+
+
+def build_routes(graph, pairs, presets: dict[str, dict], *, cache_dir: Path | None = None) -> gpd.GeoDataFrame:
+    """Shortest route plus one route per preset (``{"config": ..., "turns": TurnConfig | None, "search": fn}``).
+
+    With ``cache_dir`` each preset's routes are stored on disk and reused while the graph size,
+    OD pairs, weights and turn penalties stay the same. A cache hit does not reweight ``graph``.
+    """
+
+    pairs = list(pairs)
+    if "shortest" in presets:
+        raise ValueError("'shortest' is reserved for the physical-length baseline")
+    frames = [_preset_routes(graph, pairs, "shortest", None, None, None, cache_dir)]
+    frames += [
+        _preset_routes(graph, pairs, algorithm, preset["config"], preset.get("turns"), preset.get("search"), cache_dir)
+        for algorithm, preset in tqdm(presets.items(), desc="Routes by preset")
+    ]
+    return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), geometry="geometry", crs=graph.graph["crs"])
 
 
 def nodes_near_observations(graph, observed, max_distance_m: float = 25.0):

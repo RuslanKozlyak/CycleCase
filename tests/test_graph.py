@@ -1,5 +1,5 @@
 from cycle_routing.config import GraphConfig
-from cycle_routing.osm import graph_cache_path
+from cycle_routing.graph import graph_cache_path
 
 
 def test_graph_cache_changes_with_simplification_and_network_type(tmp_path):

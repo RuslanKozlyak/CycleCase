@@ -1,4 +1,4 @@
-"""OSMnx setup, resilient Overpass downloads, and cache metadata."""
+"""Stage 2 - routing graph: download OSM with failover, cache it, project it."""
 
 from __future__ import annotations
 
@@ -6,38 +6,24 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
 
 import networkx as nx
 import osmnx as ox
 from osmnx._errors import InsufficientResponseError, ResponseStatusCodeError
-import pandas as pd
 from requests import RequestException
 
-from .config import EXTRA_OSM_TAGS, GraphConfig
+from .config import OSM_WAY_TAGS, GraphConfig
 
 
 class GraphDownloadError(RuntimeError):
     """Raised when every configured Overpass endpoint rejects a graph query."""
 
 
-def configure_osmnx(cache_folder: Path, config: GraphConfig) -> None:
-    """Configure cache, timeout, and tags *before* graph creation or loading."""
-
-    cache_folder.mkdir(parents=True, exist_ok=True)
-    ox.settings.use_cache = True
-    ox.settings.cache_folder = cache_folder
-    ox.settings.requests_timeout = config.requests_timeout
-    ox.settings.useful_tags_way = list(
-        dict.fromkeys([*ox.settings.useful_tags_way, *EXTRA_OSM_TAGS])
-    )
-
-
 def _cache_fingerprint(config: GraphConfig) -> str:
     payload = {
         **asdict(config),
         "overpass_urls": None,
-        "useful_tags_way": sorted(EXTRA_OSM_TAGS),
+        "useful_tags_way": sorted(OSM_WAY_TAGS),
         "schema": 2,
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -86,47 +72,35 @@ def _download_graph(
     )
 
 
-def load_or_download_graph(
-    path: Path,
-    *,
+def load_graph(
+    cache_dir: Path,
+    city: str,
     config: GraphConfig,
+    crs,
+    *,
     bbox: tuple[float, float, float, float] | None = None,
     center: tuple[float, float] | None = None,
     dist: float | None = None,
-    force_download: bool = False,
+    largest_component: bool = False,
 ) -> nx.MultiDiGraph:
-    """Load a semantic cache or download sequentially with endpoint failover."""
+    """OSM bike graph with only ``OSM_WAY_TAGS``, cached as GraphML and projected to ``crs``.
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    configure_osmnx(path.parent / "http_cache", config)
-    if path.exists() and not force_download:
-        return ox.io.load_graphml(path)
+    Pass ``bbox`` or ``center`` + ``dist``. Changing the config or the tag list changes the cache file.
+    """
 
-    graph = _download_graph(bbox=bbox, center=center, dist=dist, config=config)
-    graph.graph["cycle_routing_graph_config"] = json.dumps(asdict(config), ensure_ascii=False)
-    graph.graph["cycle_routing_extra_tags"] = json.dumps(EXTRA_OSM_TAGS)
-    ox.io.save_graphml(graph, path)
-    return graph
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    ox.settings.use_cache = True
+    ox.settings.cache_folder = cache_dir / "http_cache"
+    ox.settings.requests_timeout = config.requests_timeout
+    # Only the selected tags: OSMnx defaults (name, ref, access, ...) are dropped on purpose.
+    ox.settings.useful_tags_way = list(OSM_WAY_TAGS)
 
-
-def graph_build_summary(
-    city: str,
-    downloaded_graph: nx.MultiDiGraph,
-    routing_graph: nx.MultiDiGraph,
-    config: GraphConfig,
-) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "city": city,
-                **{key: value for key, value in config.as_dict().items() if key != "overpass_urls"},
-                "downloaded_nodes": downloaded_graph.number_of_nodes(),
-                "downloaded_edges": downloaded_graph.number_of_edges(),
-                "routing_nodes": routing_graph.number_of_nodes(),
-                "routing_edges": routing_graph.number_of_edges(),
-                "downloaded_crs": str(downloaded_graph.graph.get("crs")),
-                "routing_crs": str(routing_graph.graph.get("crs")),
-                "graph_simplified_flag": downloaded_graph.graph.get("simplified", False),
-            }
-        ]
-    )
+    path = graph_cache_path(cache_dir, city, config)
+    if path.exists():
+        graph = ox.io.load_graphml(path)
+    else:
+        graph = _download_graph(bbox=bbox, center=center, dist=dist, config=config)
+        ox.io.save_graphml(graph, path)
+    if largest_component:
+        graph = ox.truncate.largest_component(graph, strongly=True)
+    return ox.projection.project_graph(graph, to_crs=crs)

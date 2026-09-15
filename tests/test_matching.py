@@ -25,12 +25,11 @@ def test_osmid_match_selects_both_directions_without_summing_subsegments():
         geometry=[LineString([(0, 0), (25, 0)]), LineString([(25, 0), (100, 0)])],
         crs="EPSG:25832",
     )
-    graph, metrics, audit = match_stadtradeln_to_graph(_graph(), observed)
+    graph, metrics = match_stadtradeln_to_graph(_graph(), observed)
     expected = (20 * 25 + 40 * 75) / 100
     assert graph.edges[1, 2, 0]["stad_trips"] == expected
     assert graph.edges[2, 1, 0]["stad_trips"] == expected
     assert metrics["stad_match_rate"] == 1
-    assert set(audit["match_method"]) == {"osmid+geometry"}
 
 
 def test_id_candidate_is_rejected_when_geometry_is_far_away():
@@ -39,7 +38,7 @@ def test_id_candidate_is_rejected_when_geometry_is_far_away():
         geometry=[LineString([(0, 100), (100, 100)])],
         crs="EPSG:25832",
     )
-    graph, metrics, _ = match_stadtradeln_to_graph(
+    graph, metrics = match_stadtradeln_to_graph(
         _graph(),
         observed,
         MatchConfig(osmid_max_distance_m=10, geometry_max_distance_m=10),
@@ -54,9 +53,8 @@ def test_geometry_fallback_mirrors_directionless_flow_to_reverse_edge():
         geometry=[LineString([(10, 1), (90, 1)])],
         crs="EPSG:25832",
     )
-    graph, metrics, audit = match_stadtradeln_to_graph(_graph(), observed)
-    assert metrics["stad_matched_via_geometry_only"] == 1
-    assert audit.iloc[0]["matched_edge_count"] == 2
+    graph, metrics = match_stadtradeln_to_graph(_graph(), observed)
+    assert metrics["stad_match_rate"] == 1
     assert graph.edges[1, 2, 0]["stad_trips"] == 20
     assert graph.edges[2, 1, 0]["stad_trips"] == 20
 
@@ -69,7 +67,7 @@ def test_geometry_fallback_keeps_one_way_edge_when_reverse_is_absent():
         geometry=[LineString([(10, 1), (90, 1)])],
         crs="EPSG:25832",
     )
-    graph, metrics, audit = match_stadtradeln_to_graph(graph, observed)
-    assert metrics["stad_matched_via_geometry_only"] == 1
-    assert audit.iloc[0]["matched_edge_count"] == 1
+    graph, metrics = match_stadtradeln_to_graph(graph, observed)
+    assert metrics["stad_match_rate"] == 1
+    assert graph.number_of_edges() == 1
     assert graph.edges[1, 2, 0]["stad_trips"] == 20

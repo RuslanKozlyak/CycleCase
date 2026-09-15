@@ -35,13 +35,34 @@ def test_feature_table_multipliers_reproduce_comfort_factor():
     graph.add_node(2, x=100, y=0)
     graph.add_edge(
         1, 2, length=100, highway="primary", surface="sett", cycleway="lane",
-        maxspeed="70", lanes="4", lit="no", geometry=LineString([(0, 0), (100, 0)]),
+        maxspeed="70", lanes="4", width="1.5", smoothness="bad", service="alley", bicycle="use_sidepath", lit="no", geometry=LineString([(0, 0), (100, 0)]),
     )
     add_comfort_cost(graph)
     row = comfort_feature_table(graph).iloc[0]
-    multipliers = ["highway_factor", "surface_factor", "cycleway_mult", "footway_mult",
-                   "maxspeed_mult", "lanes_mult", "lit_mult"]
+    multipliers = ["highway_factor", "surface_factor", "cycleway_mult", "bicycle_factor", "smoothness_factor",
+                   "service_factor", "maxspeed_mult", "lanes_mult", "width_mult", "lit_mult"]
+    assert (row[multipliers] != 1.0).all()  # each of the 10 OSM features moves the factor
     assert row["road_class"] == "крупная + велополоса"
     assert row["surface_class"] == "брусчатка"
     assert abs(row[multipliers].prod() - graph.edges[1, 2, 0]["comfort_factor"]) < 1e-12
     assert row["comfort_factor"] == graph.edges[1, 2, 0]["comfort_factor"]
+
+
+def test_presets_are_complete_and_distinct():
+    from cycle_routing.config import COMFORT_PRESETS, DEFAULT_COMFORT_CONFIG
+
+    def keys(config, prefix=""):
+        return {
+            f"{prefix}{key}" if not isinstance(value, dict) else item
+            for key, value in config.items()
+            for item in (keys(value, f"{prefix}{key}.") if isinstance(value, dict) else [None])
+        } - {None}
+
+    configs = [preset["config"] for preset in COMFORT_PRESETS.values()]
+    assert all(keys(config) >= keys(DEFAULT_COMFORT_CONFIG) for config in configs)
+    assert len({repr((preset["config"], preset["turns"])) for preset in COMFORT_PRESETS.values()}) == len(configs)
+    for config in configs:
+        graph = nx.MultiDiGraph(crs="EPSG:25832")
+        graph.add_edge(1, 2, length=100, highway="primary", surface="sett")
+        add_comfort_cost(graph, config)
+        assert graph.edges[1, 2, 0]["comfort_cost"] > 0
