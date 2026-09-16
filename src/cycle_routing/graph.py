@@ -13,6 +13,7 @@ from osmnx._errors import InsufficientResponseError, ResponseStatusCodeError
 from requests import RequestException
 
 from .config import OSM_WAY_TAGS, GraphConfig
+from .tags import tag_values
 
 
 class GraphDownloadError(RuntimeError):
@@ -72,6 +73,40 @@ def _download_graph(
     )
 
 
+# Extension point 1 of 3: edge filter. Any keep_edge(tags) -> bool works; see load_graph.
+FORBIDDEN_HIGHWAY = {
+    "motorway", "motorway_link", "trunk", "trunk_link", "construction", "proposed", "planned", "razed",
+    "abandoned", "platform", "elevator", "escalator", "corridor", "bus_guideway", "raceway", "busway", "steps",
+}
+CLOSED_ACCESS = {"private", "no", "customers", "permit", "delivery"}
+
+
+def is_rideable(tags: dict) -> bool:
+    """Default filter: drop what a bicycle may not use at all.
+
+    Roads closed to bicycles (motorway, trunk, ``bicycle=no``), steps, private and service-only access.
+    Everything merely uncomfortable (sidewalks, tracks, cobblestones) stays in the graph and is handled
+    by the comfort weights instead.
+    """
+
+    highways = tag_values(tags.get("highway"))
+    bicycle = tag_values(tags.get("bicycle"))
+    if highways & FORBIDDEN_HIGHWAY or bicycle & {"no", "dismount", "private"}:
+        return False
+    if bicycle & {"yes", "designated", "permissive"}:
+        return True
+    return not (tag_values(tags.get("access")) & CLOSED_ACCESS or "private" in tag_values(tags.get("service")))
+
+
+def filter_edges(graph: nx.MultiDiGraph, keep_edge) -> nx.MultiDiGraph:
+    """Remove edges rejected by ``keep_edge`` and the nodes left without any."""
+
+    graph = graph.copy()
+    graph.remove_edges_from([edge for edge in graph.edges(keys=True) if not keep_edge(graph.edges[edge])])
+    graph.remove_nodes_from(list(nx.isolates(graph)))
+    return graph
+
+
 def load_graph(
     cache_dir: Path,
     city: str,
@@ -81,18 +116,20 @@ def load_graph(
     bbox: tuple[float, float, float, float] | None = None,
     center: tuple[float, float] | None = None,
     dist: float | None = None,
+    keep_edge=is_rideable,
     largest_component: bool = False,
 ) -> nx.MultiDiGraph:
-    """OSM bike graph with only ``OSM_WAY_TAGS``, cached as GraphML and projected to ``crs``.
+    """OSM graph with only ``OSM_WAY_TAGS``, cached as GraphML and projected to ``crs``.
 
-    Pass ``bbox`` or ``center`` + ``dist``. Changing the config or the tag list changes the cache file.
+    Pass ``bbox`` or ``center`` + ``dist``. The raw download is cached; ``keep_edge`` is applied after
+    loading, so a different filter costs no download. ``keep_edge=None`` keeps every edge.
     """
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     ox.settings.use_cache = True
     ox.settings.cache_folder = cache_dir / "http_cache"
     ox.settings.requests_timeout = config.requests_timeout
-    # Only the selected tags: OSMnx defaults (name, ref, access, ...) are dropped on purpose.
+    # Only the selected tags: OSMnx defaults (name, ref, ...) are dropped on purpose.
     ox.settings.useful_tags_way = list(OSM_WAY_TAGS)
 
     path = graph_cache_path(cache_dir, city, config)
@@ -101,6 +138,8 @@ def load_graph(
     else:
         graph = _download_graph(bbox=bbox, center=center, dist=dist, config=config)
         ox.io.save_graphml(graph, path)
+    if keep_edge is not None:
+        graph = filter_edges(graph, keep_edge)
     if largest_component:
         graph = ox.truncate.largest_component(graph, strongly=True)
     return ox.projection.project_graph(graph, to_crs=crs)

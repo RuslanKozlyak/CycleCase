@@ -13,6 +13,15 @@ from .evaluation import (
     route_edge_association,
     route_edges_long,
 )
-from .graph import load_graph
+from .graph import filter_edges, is_rideable, load_graph
 from .matching import match_stadtradeln_to_graph, snap_tracks_to_edges, track_edge_usage
-from .routing import build_routes, count_turns, dijkstra, dijkstra_turns, nodes_near_observations, sample_od_pairs
+from .routing import (
+    build_routes,
+    count_turns,
+    dijkstra,
+    dijkstra_turns,
+    edge_bearings,
+    nodes_near_observations,
+    sample_od_pairs,
+    turn_kind,
+)

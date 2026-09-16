@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 import hashlib
 from itertools import count
 import json
@@ -47,14 +47,16 @@ def _bearing(start: tuple[float, float], end: tuple[float, float]) -> float:
     return math.degrees(math.atan2(dx, dy)) % 360
 
 
-def _edge_bearings(graph, edge: EdgeKey) -> tuple[float, float]:
+def edge_bearings(graph, edge: EdgeKey) -> tuple[float, float]:
     """Travel bearing when entering and when leaving the edge."""
 
     coordinates = _oriented_coordinates(graph, edge)
     return _bearing(coordinates[0], coordinates[1]), _bearing(coordinates[-2], coordinates[-1])
 
 
-def _turn_kind(incoming_bearing: float, outgoing_bearing: float, config: TurnConfig) -> str:
+def turn_kind(incoming_bearing: float, outgoing_bearing: float, config: TurnConfig) -> str:
+    """"straight", "slight", "right", "left" or "u_turn" from the two travel bearings."""
+
     difference = (outgoing_bearing - incoming_bearing + 180) % 360 - 180
     absolute = abs(difference)
     if absolute <= config.straight_angle_max_deg:
@@ -86,8 +88,12 @@ def dijkstra(graph, origin: int, destination: int, weight: str, turns: TurnConfi
     ] or None
 
 
-def dijkstra_turns(graph, origin: int, destination: int, weight: str, turns: TurnConfig) -> list[EdgeKey] | None:
+# Extension point 3b: the turn model. ``turns`` is a TurnConfig, or any function
+#     turn_penalty(graph, incoming_edge, outgoing_edge) -> metres
+def dijkstra_turns(graph, origin: int, destination: int, weight: str, turns) -> list[EdgeKey] | None:
     """Dijkstra whose state is the incoming directed edge, so every turn adds its penalty."""
+
+    penalty = turns if callable(turns) else None
 
     start = (origin, None)
     distances = {start: 0.0}
@@ -97,9 +103,9 @@ def dijkstra_turns(graph, origin: int, destination: int, weight: str, turns: Tur
     target = None
     bearings: dict[EdgeKey, tuple[float, float]] = {}
 
-    def edge_bearings(edge: EdgeKey) -> tuple[float, float]:
+    def cached_bearings(edge: EdgeKey) -> tuple[float, float]:
         if edge not in bearings:
-            bearings[edge] = _edge_bearings(graph, edge)
+            bearings[edge] = edge_bearings(graph, edge)
         return bearings[edge]
 
     while queue:
@@ -114,7 +120,11 @@ def dijkstra_turns(graph, origin: int, destination: int, weight: str, turns: Tur
             outgoing = (node, neighbour, key)
             new_cost = cost + float(data.get(weight, data.get("length", 1.0)))
             if incoming is not None:
-                new_cost += turns.penalty(_turn_kind(edge_bearings(incoming)[1], edge_bearings(outgoing)[0], turns))
+                new_cost += (
+                    penalty(graph, incoming, outgoing)
+                    if penalty is not None
+                    else turns.penalty(turn_kind(cached_bearings(incoming)[1], cached_bearings(outgoing)[0], turns))
+                )
             new_state = (neighbour, outgoing)
             if new_cost < distances.get(new_state, math.inf):
                 distances[new_state] = new_cost
@@ -167,9 +177,9 @@ def route_record(
 def count_turns(graph, edge_route: list[EdgeKey], config: TurnConfig = TurnConfig()) -> int:
     """Left, right and U-turns along the route; slight bends do not count."""
 
-    bearings = [_edge_bearings(graph, tuple(edge)) for edge in edge_route]
+    bearings = [edge_bearings(graph, tuple(edge)) for edge in edge_route]
     return sum(
-        _turn_kind(incoming[1], outgoing[0], config) in {"left", "right", "u_turn"}
+        turn_kind(incoming[1], outgoing[0], config) in {"left", "right", "u_turn"}
         for incoming, outgoing in zip(bearings, bearings[1:])
     )
 
@@ -203,7 +213,9 @@ def sample_od_pairs(
     raise RuntimeError(f"Only {len(pairs)} OD pairs found")
 
 
-def _preset_routes(graph, pairs, algorithm, config, turns, search, cache_dir: Path | None) -> pd.DataFrame:
+def _preset_routes(graph, pairs, algorithm, preset, cache_dir: Path | None) -> pd.DataFrame:
+    config, turns = preset.get("config"), preset.get("turns")
+    cost, search = preset.get("cost"), preset.get("search")
     path = None
     if cache_dir is not None:
         # ponytail: the graph is identified by its size only; clear cache_dir after re-downloading OSM.
@@ -211,14 +223,15 @@ def _preset_routes(graph, pairs, algorithm, config, turns, search, cache_dir: Pa
             "graph": [graph.number_of_nodes(), graph.number_of_edges(), str(graph.graph["crs"])],
             "pairs": [[od_id, int(origin), int(destination)] for od_id, origin, destination in pairs],
             "config": config,
-            "turns": asdict(turns) if turns is not None else None,
+            "turns": asdict(turns) if is_dataclass(turns) else getattr(turns, "__name__", None),
             "search": getattr(search, "__name__", None),
+            "cost": getattr(cost, "__name__", None),
         }, sort_keys=True)
         path = Path(cache_dir) / f"{algorithm}_{hashlib.sha256(key.encode()).hexdigest()[:12]}.pkl"
         if path.exists():
             return pd.read_pickle(path)
-    if config is not None:
-        add_comfort_cost(graph, config)
+    if algorithm != "shortest":
+        add_comfort_cost(graph, config, cost)
     records = [
         route_record(graph, origin, destination, algorithm, od_id, turn_config=turns, search=search)
         for od_id, origin, destination in pairs
@@ -231,18 +244,20 @@ def _preset_routes(graph, pairs, algorithm, config, turns, search, cache_dir: Pa
 
 
 def build_routes(graph, pairs, presets: dict[str, dict], *, cache_dir: Path | None = None) -> gpd.GeoDataFrame:
-    """Shortest route plus one route per preset (``{"config": ..., "turns": TurnConfig | None, "search": fn}``).
+    """Shortest route plus one route per preset.
 
-    With ``cache_dir`` each preset's routes are stored on disk and reused while the graph size,
-    OD pairs, weights and turn penalties stay the same. A cache hit does not reweight ``graph``.
+    A preset is a dict: ``config`` (comfort weights) or ``cost`` (own cost function), ``turns``
+    (TurnConfig or None) and ``search`` (routing algorithm, default Dijkstra). With ``cache_dir`` each
+    preset's routes are cached on disk while graph size, OD pairs and preset stay the same; a cache hit
+    does not reweight ``graph``.
     """
 
     pairs = list(pairs)
     if "shortest" in presets:
         raise ValueError("'shortest' is reserved for the physical-length baseline")
-    frames = [_preset_routes(graph, pairs, "shortest", None, None, None, cache_dir)]
+    frames = [_preset_routes(graph, pairs, "shortest", {}, cache_dir)]
     frames += [
-        _preset_routes(graph, pairs, algorithm, preset["config"], preset.get("turns"), preset.get("search"), cache_dir)
+        _preset_routes(graph, pairs, algorithm, preset, cache_dir)
         for algorithm, preset in tqdm(presets.items(), desc="Routes by preset")
     ]
     return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), geometry="geometry", crs=graph.graph["crs"])

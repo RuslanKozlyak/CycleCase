@@ -83,3 +83,19 @@ def test_build_routes_reuses_disk_cache(tmp_path, monkeypatch):
     monkeypatch.undo()
     routing.build_routes(graph, [("OD", 1, 3)], changed, cache_dir=tmp_path)
     assert len(list(tmp_path.glob("*.pkl"))) == 3
+
+
+def test_turn_model_can_be_replaced_by_a_function():
+    """Own turn model: free where the road just bends, expensive at a real junction."""
+
+    graph = _corner_or_straight()
+
+    def junction_only(graph, incoming, outgoing):
+        node = outgoing[0]
+        return 60.0 if graph.out_degree(node) > 1 else 0.0
+
+    assert graph.out_degree(2) > 1  # node 2 is a junction: 2->3 and 2->4
+    assert dijkstra_turns(graph, 1, 3, "comfort_cost", junction_only) == [(1, 3, 0)]
+
+    free = lambda graph, incoming, outgoing: 0.0
+    assert dijkstra_turns(graph, 1, 3, "comfort_cost", free) == [(1, 2, 0), (2, 3, 0)]

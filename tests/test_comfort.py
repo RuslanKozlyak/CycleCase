@@ -66,3 +66,11 @@ def test_presets_are_complete_and_distinct():
         graph.add_edge(1, 2, length=100, highway="primary", surface="sett")
         add_comfort_cost(graph, config)
         assert graph.edges[1, 2, 0]["comfort_cost"] > 0
+
+
+def test_custom_cost_function_replaces_the_weights():
+    graph = nx.MultiDiGraph(crs="EPSG:25832")
+    graph.add_edge(1, 2, length=100, highway="primary", surface="asphalt")
+    add_comfort_cost(graph, cost=lambda tags: 7.0 if "primary" in str(tags["highway"]) else 1.0)
+    assert graph.edges[1, 2, 0]["comfort_cost"] == 7.0
+    assert graph.edges[1, 2, 0]["comfort_factor"] == 0.07

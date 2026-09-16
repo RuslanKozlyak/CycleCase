@@ -23,14 +23,14 @@ OSM_FEATURE_TAGS = (
     "width",
     "service",
 )
-OSM_WAY_TAGS = ("oneway", "junction", *OSM_FEATURE_TAGS)
+OSM_WAY_TAGS = ("oneway", "junction", "access", *OSM_FEATURE_TAGS)
 
 
 @dataclass(frozen=True, slots=True)
 class GraphConfig:
     """Parameters that determine graph semantics and its cache identity."""
 
-    network_type: str = "bike"
+    network_type: str = "all"  # "all" keeps sidewalks and forbidden roads; keep_edge / weights deal with them
     simplify: bool = True
     retain_all: bool = False
     truncate_by_edge: bool = True

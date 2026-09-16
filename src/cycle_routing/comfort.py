@@ -138,16 +138,27 @@ def comfort_components(data: Mapping[str, object], config: Mapping[str, object] 
     }
 
 
+# Extension point 2 of 3: cost function. Any cost(tags) -> metres works; see add_comfort_cost.
 def add_comfort_cost(
     graph: nx.MultiDiGraph,
     config: Mapping[str, object] | None = None,
+    cost=None,
 ) -> nx.MultiDiGraph:
-    """Add ``comfort_factor`` and additive ``comfort_cost`` to every edge."""
+    """Write ``comfort_cost`` (the routing weight, in metres) on every edge.
+
+    Default: ``length × comfort_factor`` from ``config``. Pass ``cost(tags) -> float`` to replace the
+    whole formula; ``comfort_factor`` is then the cost per metre.
+    """
 
     cfg = config or DEFAULT_COMFORT_CONFIG
     for _, _, _, data in graph.edges(keys=True, data=True):
-        factors = _comfort_factors(_edge_tags(data), cfg)
-        data["comfort_factor"], data["comfort_cost"] = _factor_and_cost(data, factors, cfg)
+        if cost is None:
+            factors = _comfort_factors(_edge_tags(data), cfg)
+            data["comfort_factor"], data["comfort_cost"] = _factor_and_cost(data, factors, cfg)
+        else:
+            length = max(float(data.get("length", 1.0)), MIN_LENGTH_M)
+            data["comfort_cost"] = float(cost(data))
+            data["comfort_factor"] = data["comfort_cost"] / length
     return graph
 
 
