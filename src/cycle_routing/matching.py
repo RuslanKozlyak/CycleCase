@@ -1,4 +1,7 @@
-"""Stage 3 - mapping observations onto graph edges: STADTRADELN volumes and GPX tracks."""
+"""Mapping observations onto edges: STADTRADELN volumes and GPX tracks.
+
+Results are separate Series aligned with the edge table; nothing is written into the table or a graph.
+"""
 
 from __future__ import annotations
 
@@ -9,12 +12,12 @@ import networkx as nx
 import numpy as np
 import osmnx as ox
 import pandas as pd
+import shapely
 
 from .config import MatchConfig
 from .tags import edge_osmid_set
 
 
-EdgeKey = tuple[int, int, int]
 TRIPS = "number_of_matched_trips"
 
 
@@ -37,46 +40,48 @@ def _nearest_indices(observed_geometry, candidates: gpd.GeoDataFrame, max_distan
     return distances.index[distances <= minimum + tie_tolerance].tolist(), minimum
 
 
-def match_stadtradeln_to_graph(
-    graph: nx.MultiDiGraph,
+def match_stadtradeln(
+    edges: gpd.GeoDataFrame,
     observed: gpd.GeoDataFrame,
     config: MatchConfig | None = None,
-) -> tuple[nx.MultiDiGraph, dict[str, float]]:
-    """Put STADTRADELN trips on graph edges as ``stad_trips``.
+) -> tuple[pd.Series, dict[str, float]]:
+    """STADTRADELN trips per edge; ``edges`` needs ``u``, ``v``, ``osmid`` and a geometry.
 
     A segment is matched by ``osm_way_id`` when a same-ID edge lies within ``osmid_max_distance_m``,
     otherwise to the nearest edge within ``geometry_max_distance_m`` (plus its reverse twin, because
     volumes have no direction). Several segments on one edge are averaged weighted by segment length.
+    Returns trips indexed like ``edges`` (0 where nothing matched) and match-quality numbers.
     """
 
     cfg = config or MatchConfig()
-    if observed.crs is None or graph.graph.get("crs") is None:
-        raise ValueError("Both graph and observed data must have a CRS")
-    observed = observed.to_crs(graph.graph["crs"])
+    if observed.crs is None or edges.crs is None:
+        raise ValueError("Both edges and observed data must have a CRS")
+    observed = observed.to_crs(edges.crs)
 
-    edges = ox.graph_to_gdfs(graph, nodes=False, fill_edge_geometry=True).reset_index()
-    edges["edge_key"] = list(zip(edges["u"], edges["v"], edges["key"]))
-    edges["osmids"] = [edge_osmid_set(row) for row in edges.to_dict("records")]
+    table = gpd.GeoDataFrame(
+        {"u": edges["u"].to_numpy(), "v": edges["v"].to_numpy()}, geometry=edges.geometry.to_numpy(), crs=edges.crs
+    )
+    table["osmids"] = [edge_osmid_set({"osmid": value}) for value in edges["osmid"]]
     osmid_to_edges: dict[int, list[int]] = defaultdict(list)
-    for edge_index, osmids in edges["osmids"].items():
+    for edge_index, osmids in table["osmids"].items():
         for osmid in osmids:
             osmid_to_edges[osmid].append(edge_index)
 
-    assignments: dict[EdgeKey, list[tuple[float, float]]] = defaultdict(list)  # edge -> [(trips, segment length)]
+    assignments: dict[int, list[tuple[float, float]]] = defaultdict(list)  # edge row -> [(trips, segment length)]
     distances: dict[object, float] = {}  # matched segment -> match distance
 
     def assign(observed_index, edge_indices, distance):
         row = observed.loc[observed_index]
         distances[observed_index] = distance
         for edge_index in edge_indices:
-            assignments[edges.at[edge_index, "edge_key"]].append((float(row[TRIPS]), float(row.geometry.length)))
+            assignments[edge_index].append((float(row[TRIPS]), float(row.geometry.length)))
 
     unmatched = []
     for observed_index, row in observed.iterrows():
         osmid = row.get("osm_way_id")
         candidates = osmid_to_edges.get(int(osmid), []) if pd.notna(osmid) else []
         selected, distance = (
-            _nearest_indices(row.geometry, edges.loc[candidates], cfg.osmid_max_distance_m, cfg.direction_tie_tolerance_m)
+            _nearest_indices(row.geometry, table.loc[candidates], cfg.osmid_max_distance_m, cfg.direction_tie_tolerance_m)
             if candidates else ([], None)
         )
         if selected:
@@ -88,18 +93,18 @@ def match_stadtradeln_to_graph(
         midpoints = observed.loc[unmatched, ["geometry"]].copy()
         midpoints.geometry = midpoints.geometry.interpolate(0.5, normalized=True)
         nearest = (
-            gpd.sjoin_nearest(midpoints, edges[["geometry"]], max_distance=cfg.geometry_max_distance_m, distance_col="d")
+            gpd.sjoin_nearest(midpoints, table[["geometry"]], max_distance=cfg.geometry_max_distance_m, distance_col="d")
             .reset_index(names="observed_index")
             .sort_values(["observed_index", "d", "index_right"])
             .drop_duplicates("observed_index")
         )
         for match in nearest.itertuples():
             edge_index = int(match.index_right)
-            u, v, _ = edges.at[edge_index, "edge_key"]
+            u, v = table.at[edge_index, "u"], table.at[edge_index, "v"]
             selected = [edge_index]
             # Mirror the directionless volume to the reverse twin of the same OSM way, never to a one-way edge.
-            reverse = edges[(edges["u"] == v) & (edges["v"] == u)] if u != v else edges.iloc[0:0]
-            base_osmids = edges.at[edge_index, "osmids"]
+            reverse = table[(table["u"] == v) & (table["v"] == u)] if u != v else table.iloc[0:0]
+            base_osmids = table.at[edge_index, "osmids"]
             if base_osmids and not reverse.empty:
                 reverse = reverse[reverse["osmids"].map(lambda values: bool(values & base_osmids))]
             if not reverse.empty:
@@ -108,23 +113,40 @@ def match_stadtradeln_to_graph(
                 selected += [index for index in reverse.index[close] if index != edge_index]
             assign(match.observed_index, selected, float(match.d))
 
-    for _, _, _, data in graph.edges(keys=True, data=True):
-        data["stad_trips"] = 0.0
-    for edge_key, values in assignments.items():
-        trips, lengths = zip(*values)
-        graph.edges[edge_key]["stad_trips"] = float(np.average(trips, weights=np.maximum(lengths, 0.01)))
+    trips = np.zeros(len(table))
+    for edge_index, values in assignments.items():
+        edge_trips, lengths = zip(*values)
+        trips[edge_index] = float(np.average(edge_trips, weights=np.maximum(lengths, 0.01)))
 
     matched = pd.Series(distances, dtype=float)
     metrics = {
         "stad_match_rate": len(matched) / len(observed) if len(observed) else 0.0,
         "p95_match_distance_m": float(matched.quantile(0.95)) if len(matched) else np.nan,
-        "osm_edge_match_rate": len(assignments) / graph.number_of_edges() if graph.number_of_edges() else 0.0,
+        "osm_edge_match_rate": len(assignments) / len(table) if len(table) else 0.0,
     }
+    return pd.Series(trips, index=edges.index, name="trips"), metrics
+
+
+def match_stadtradeln_to_graph(
+    graph: nx.MultiDiGraph,
+    observed: gpd.GeoDataFrame,
+    config: MatchConfig | None = None,
+) -> tuple[nx.MultiDiGraph, dict[str, float]]:
+    """Legacy adapter returning the old graph-shaped result.
+
+    New preparation code calls :func:`match_stadtradeln` and stores its Series in
+    ``popularity.parquet``; this adapter exists only for backwards-compatible examples.
+    """
+
+    edges = ox.graph_to_gdfs(graph, nodes=False, fill_edge_geometry=True).reset_index()
+    trips, metrics = match_stadtradeln(edges, observed, config)
+    for edge, value in zip(edges[["u", "v", "key"]].itertuples(index=False, name=None), trips):
+        graph.edges[edge]["stad_trips"] = float(value)
     return graph, metrics
 
 
 def snap_tracks_to_edges(
-    graph,
+    edges: gpd.GeoDataFrame,
     tracks: gpd.GeoDataFrame,
     *,
     step_m: float = 25.0,
@@ -132,24 +154,25 @@ def snap_tracks_to_edges(
 ) -> pd.DataFrame:
     """Sample every track each ``step_m`` metres and attach samples to the nearest edge."""
 
+    tree = shapely.STRtree(edges.geometry.to_numpy())
+    keys = edges[["u", "v", "key"]].to_numpy()
     rows = []
     for track in tracks.itertuples():
         points = sample_geometry(track.geometry, step_m)
-        edges, distances = ox.distance.nearest_edges(
-            graph, X=[point.x for point in points], Y=[point.y for point in points], return_dist=True
-        )
+        (sample, position), distances = tree.query_nearest(points, all_matches=False, return_distance=True)
+        order = np.argsort(sample, kind="stable")
         rows.extend(
             {"od_id": track.activity_id, "u": int(u), "v": int(v), "key": int(key), "weight": step_m}
-            for (u, v, key), distance in zip(edges, distances, strict=True)
+            for (u, v, key), distance in zip(keys[position[order]], distances[order], strict=True)
             if distance <= max_distance_m
         )
     return pd.DataFrame(rows, columns=["od_id", "u", "v", "key", "weight"])
 
 
-def track_edge_usage(snapped: pd.DataFrame, features: pd.DataFrame) -> pd.Series:
+def track_edge_usage(snapped: pd.DataFrame, edges: pd.DataFrame) -> pd.Series:
     """Number of distinct tracks passing each edge, in either direction."""
 
     pairs = snapped.assign(pair=[frozenset(pair) for pair in zip(snapped["u"], snapped["v"])])
     counts = pairs.drop_duplicates(["od_id", "pair"])["pair"].value_counts()
-    feature_pairs = [frozenset(pair) for pair in zip(features.index.get_level_values("u"), features.index.get_level_values("v"))]
-    return pd.Series(counts.reindex(feature_pairs).fillna(0).to_numpy(), index=features.index, name="tracks")
+    edge_pairs = [frozenset(pair) for pair in zip(edges["u"], edges["v"])]
+    return pd.Series(counts.reindex(edge_pairs).fillna(0).to_numpy(), index=edges.index, name="trips")

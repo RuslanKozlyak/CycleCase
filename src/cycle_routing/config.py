@@ -6,8 +6,9 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 
-# OSM way tags kept on graph edges: 10 features picked by association with STADTRADELN trips
-# in Konstanz (cycleway:* counts as one feature), plus oneway/junction that OSMnx needs to orient edges.
+# OSM way tags downloaded with the graph: 10 features picked by association with STADTRADELN trips
+# in Konstanz (cycleway:* counts as one feature), oneway/junction that OSMnx needs to orient edges,
+# and access for the rideability filter. Changing this list changes every cache key.
 OSM_FEATURE_TAGS = (
     "highway",
     "surface",
@@ -136,121 +137,23 @@ DEFAULT_COMFORT_CONFIG = {
 }
 
 
-def _with_overrides(base: dict, overrides: dict) -> dict:
+def with_overrides(base: dict, overrides: dict) -> dict:
     """Deep copy of ``base`` with nested ``overrides`` applied."""
 
     result = deepcopy(base)
     for key, value in overrides.items():
         if isinstance(value, dict):
-            result[key] = _with_overrides(result.get(key, {}), value)
+            result[key] = with_overrides(result.get(key, {}), value)
         else:
             result[key] = value
     return result
 
 
-_FAST_CONFIG = _with_overrides(DEFAULT_COMFORT_CONFIG, {
-    "highway": {
-        "cycleway": 0.85, "living_street": 0.95, "path": 1.05, "service": 1.05,
-        "unclassified": 1.0, "pedestrian": 1.15, "footway": 1.2, "track": 1.3,
-        "tertiary": 1.0, "secondary": 1.05, "primary": 1.15, "trunk": 2.0,
-    },
-    "surface": {"sett": 1.2, "cobblestone": 1.25, "gravel": 1.2, "ground": 1.3, "dirt": 1.4, "unpaved": 1.25},
-    "multipliers": {"dedicated_cycleway": 0.9, "many_lanes": 1.0, "narrow": 1.0, "unlit": 1.0},
-    "smoothness": {"bad": 1.15, "very_bad": 1.3},
-    "service": {"driveway": 1.1, "parking_aisle": 1.1},
-    "maxspeed": {"max_extra": 0.1},
-    "defaults": {"highway": 1.1, "surface": 1.05},
-})
+def __getattr__(name: str):
+    """Keep ``cycle_routing.config.COMFORT_PRESETS`` as a lazy compatibility alias."""
 
+    if name == "COMFORT_PRESETS":
+        from .presets import COMFORT_PRESETS
 
-# Rider profiles: comfort weights plus turn penalties. Each preset exaggerates one preference
-# so that routes visibly differ.
-COMFORT_PRESETS = {
-    "balanced": {
-        "label": "сбалансированный",
-        "description": "Исходные веса: умеренный штраф крупных дорог и плохого покрытия.",
-        "config": deepcopy(DEFAULT_COMFORT_CONFIG),
-    },
-    "fast": {
-        "label": "быстрый",
-        "description": "Почти кратчайший путь: тип дороги и покрытие почти не штрафуются.",
-        "config": _FAST_CONFIG,
-    },
-    "min_turns": {
-        "label": "минимум поворотов",
-        "description": "Длинные прямые участки: веса как у быстрого, поворот стоит в 10 раз дороже обычного.",
-        "config": deepcopy(_FAST_CONFIG),
-        "turns": TurnConfig(slight_penalty_m=80.0, right_penalty_m=200.0, left_penalty_m=300.0, u_turn_penalty_m=900.0),
-    },
-    "avenues": {
-        "label": "по проспектам",
-        "description": (
-            "Как в ваших треках по СПб: крупные улицы без штрафа, заметный бонус за автобусные "
-            "и велополосы на них (лучший вариант перебора весов по GPX)."
-        ),
-        "config": _with_overrides(DEFAULT_COMFORT_CONFIG, {
-            "highway": {"secondary": 1.0, "primary": 1.0},
-            "multipliers": {"dedicated_cycleway": 0.5},
-        }),
-    },
-    "quiet": {
-        "label": "спокойный",
-        "description": "Подальше от машин: штраф улиц с движением и скоростью выше 30 км/ч, бонус жилых зон и парков.",
-        "config": _with_overrides(DEFAULT_COMFORT_CONFIG, {
-            "highway": {
-                "cycleway": 0.5, "living_street": 0.6, "pedestrian": 0.8, "path": 0.75, "footway": 1.1,
-                "service": 1.3, "unclassified": 1.6, "tertiary": 2.2, "secondary": 3.2, "primary": 4.5, "trunk": 7.0,
-            },
-            # A painted lane does not make a busy road calm.
-            "multipliers": {"dedicated_cycleway": 1.0, "many_lanes": 1.8},
-            "maxspeed": {"threshold_kmh": 30.0, "scale_kmh": 40.0, "max_extra": 1.0},
-        }),
-    },
-    "bike_infra": {
-        "label": "велоинфраструктура",
-        "description": "Только велодорожки и велополосы, остальные улицы и тротуары заметно дороже.",
-        "config": _with_overrides(DEFAULT_COMFORT_CONFIG, {
-            "highway": {
-                "cycleway": 0.3, "living_street": 1.1, "service": 1.5, "unclassified": 1.4, "tertiary": 1.6,
-                "path": 1.2, "track": 1.6, "footway": 2.0, "pedestrian": 1.8,
-            },
-            "multipliers": {"dedicated_cycleway": 0.35},
-            "bicycle": {"designated": 0.6, "use_sidepath": 2.5},
-            "min_factor": 0.25,
-        }),
-    },
-    "smooth": {
-        "label": "гладкий асфальт",
-        "description": "Шоссейный велосипед: сильный штраф брусчатки, плитки, грунта и неизвестного покрытия.",
-        "config": _with_overrides(DEFAULT_COMFORT_CONFIG, {
-            "highway": {"path": 1.5, "track": 2.2, "footway": 1.6, "pedestrian": 1.4, "secondary": 1.3, "primary": 1.6},
-            "surface": {
-                "paved": 1.05, "concrete": 1.1, "paving_stones": 1.6, "sett": 2.8, "cobblestone": 3.2,
-                "compacted": 2.0, "fine_gravel": 2.2, "gravel": 3.0, "ground": 3.5, "dirt": 3.5,
-                "sand": 5.0, "grass": 5.0, "unpaved": 3.0,
-            },
-            "smoothness": {"intermediate": 1.3, "bad": 2.0, "very_bad": 3.0, "horrible": 5.0},
-            "multipliers": {"narrow": 1.5},
-            "defaults": {"surface": 1.6},
-        }),
-    },
-    "nature": {
-        "label": "парки и грунт",
-        "description": "Гревел и прогулка: тропы, парки и грунт в плюс, крупные дороги в минус.",
-        "config": _with_overrides(DEFAULT_COMFORT_CONFIG, {
-            "highway": {
-                "path": 0.55, "track": 0.65, "cycleway": 0.6, "footway": 0.9, "pedestrian": 0.9,
-                "tertiary": 1.5, "secondary": 2.2, "primary": 3.0,
-            },
-            "surface": {
-                "compacted": 0.9, "fine_gravel": 0.9, "gravel": 1.0, "ground": 1.0, "dirt": 1.05,
-                "unpaved": 1.0, "grass": 1.3, "paving_stones": 1.0,
-            },
-            "multipliers": {"unlit": 1.0},
-            "defaults": {"surface": 1.0},
-        }),
-    },
-}
-# Presets without their own "turns" use the ordinary penalties.
-for _preset in COMFORT_PRESETS.values():
-    _preset.setdefault("turns", TurnConfig())
+        return COMFORT_PRESETS
+    raise AttributeError(name)

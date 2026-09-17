@@ -14,4 +14,6 @@ graphify-out/
 .vscode/settings.json
 notebooks/data/stadtradeln_konstanz/
 notebooks/data/osm/
+notebooks/data/cities/
 outputs/
+.tmp/

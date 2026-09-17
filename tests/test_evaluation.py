@@ -3,7 +3,12 @@ import pandas as pd
 from shapely.geometry import LineString
 
 from cycle_routing.comfort import comfort_feature_table
-from cycle_routing.evaluation import composition_table, route_edge_association, route_edges_long
+from cycle_routing.evaluation import (
+    composition_table,
+    route_edge_association,
+    route_edge_value_sums,
+    route_edges_long,
+)
 
 
 def _ladder():
@@ -35,3 +40,19 @@ def test_association_rewards_route_on_popular_edges():
     composition = composition_table(route_edges_long(routes, features), features, "road_class")
     assert composition.loc["busy", "велодорожка"] == 100
     assert composition.loc["quiet", "крупная дорога"] == 100
+
+
+def test_route_edge_value_sums_all_trips_and_counts_repeated_edges():
+    features = pd.DataFrame(
+        {"trips": [10.0, 20.0]},
+        index=pd.MultiIndex.from_tuples([(1, 2, 0), (2, 3, 0)], names=["u", "v", "key"]),
+    )
+    edge_rows = pd.DataFrame({
+        "group": ["mine", "mine", "mine", "other"],
+        "u": [1, 2, 1, 2],
+        "v": [2, 3, 2, 3],
+        "key": [0, 0, 0, 0],
+    })
+
+    result = route_edge_value_sums(edge_rows, features, "trips")
+    assert result.to_dict() == {"mine": 40.0, "other": 20.0}

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import html
+import json
+from pathlib import Path
 
 from branca.colormap import LinearColormap
 from branca.element import Element, Figure, MacroElement
@@ -11,11 +14,14 @@ import folium
 from folium.elements import JSCSSMixin
 from folium.template import Template
 import numpy as np
+import pandas as pd
 from pyproj import Transformer
 from shapely.geometry import LineString
 
-from .config import COMFORT_PRESETS
-from .routing import _oriented_coordinates
+from .comfort import comfort_feature_table
+from .preparation import load_popularity
+from .presets import COMFORT_PRESETS
+from .routing import SHORTEST, orient_coordinates
 
 
 ROUTE_OUTLINES = {
@@ -30,7 +36,7 @@ ROUTE_OUTLINES = {
     "nature": "#7c2d12",
 }
 ROUTE_LABELS = {
-    "shortest": "кратчайший",
+    "shortest": SHORTEST["label"],
     **{key: preset["label"] for key, preset in COMFORT_PRESETS.items()},
 }
 BASEMAPS = {
@@ -41,6 +47,7 @@ BASEMAPS = {
 }
 # Heatmap from good (green) to bad (red).
 GOOD_BAD_COLORS = ["#16a34a", "#84cc16", "#facc15", "#f97316", "#dc2626"]
+POPULARITY_COLORS = ["#dbeafe", "#60a5fa", "#2563eb", "#7c3aed", "#be123c"]
 ROAD_CLASS_COLORS = {
     "велодорожка": "#16a34a",
     "крупная + велополоса": "#f59e0b",
@@ -61,10 +68,14 @@ SURFACE_CLASS_COLORS = {
 
 @dataclass(frozen=True)
 class Panel:
-    """What one map of the grid shows: a feature column and how to colour it."""
+    """What one map of the grid shows and how to colour it.
+
+    ``values`` is a column of the edge table or a function ``values(route_edges) -> Series`` of the
+    route edges (indexed by ``u, v, key``).
+    """
 
     title: str
-    column: str
+    values: str | Callable[[pd.DataFrame], pd.Series]
     categories: dict[str, str] = field(default_factory=dict)
     log: bool = False
     low_label: str = "Низкая"
@@ -198,12 +209,12 @@ def _to_latlon(coordinates, to_wgs84, tolerance_m: float = 3.0):
     return list(zip(lat, lon))
 
 
-def _colour_runs(graph, edge_route, colours, labels):
+def _colour_runs(lines, edge_route, colours, labels):
     """Merge consecutive edges of the same colour into one projected coordinate run."""
 
     runs = []
     for edge in map(tuple, edge_route):
-        points = _oriented_coordinates(graph, edge)
+        points = lines[edge]
         if runs and runs[-1][0] == colours[edge]:
             runs[-1][2].extend(points[1:])
         else:
@@ -211,28 +222,207 @@ def _colour_runs(graph, edge_route, colours, labels):
     return runs
 
 
+# --- panel values: functions of the route edges, like comfort functions -----------------------
+
+
+def road_classes(edges: pd.DataFrame) -> pd.Series:
+    return pd.Series(comfort_feature_table(edges)["road_class"].to_numpy(), index=edges.index)
+
+
+def surface_classes(edges: pd.DataFrame) -> pd.Series:
+    return pd.Series(comfort_feature_table(edges)["surface_class"].to_numpy(), index=edges.index)
+
+
+def cost_per_metre(cost: Callable[[pd.DataFrame], pd.Series]) -> Callable[[pd.DataFrame], pd.Series]:
+    """Panel values: what one metre of each edge costs under a comfort function."""
+
+    return lambda edges: cost(edges) / edges["length_m"].clip(lower=0.1)
+
+
+def popularity(city: str, *, cache_dir: Path) -> Callable[[pd.DataFrame], pd.Series]:
+    """Panel values: observed trips (STADTRADELN) or your tracks (GPX) on each edge."""
+
+    def values(edges: pd.DataFrame) -> pd.Series:
+        trips = load_popularity(city, cache_dir=cache_dir).set_index(["u", "v", "key"])["trips"]
+        return pd.Series(
+            trips.reindex(pd.MultiIndex.from_frame(edges[["u", "v", "key"]])).to_numpy(), index=edges.index
+        )
+
+    return values
+
+
+_POPULARITY_POPUP_COLUMNS = {
+    "trips": "Поездок",
+    "u": "Начальный узел (u)",
+    "v": "Конечный узел (v)",
+    "key": "Ключ ребра",
+    "length_m": "Длина, м",
+    "highway": "highway",
+    "surface": "surface",
+    "smoothness": "smoothness",
+    "cycleway": "cycleway",
+    "bicycle": "bicycle",
+    "lit": "lit",
+    "service": "service",
+    "access": "access",
+    "maxspeed": "maxspeed",
+    "lanes": "lanes",
+    "width": "width",
+    "oneway": "oneway",
+}
+
+
+def _edges_with_popularity(edges, trips: pd.DataFrame):
+    """Attach the separate popularity table without relying on its row order."""
+
+    keys = ["u", "v", "key"]
+    missing_columns = {*keys, "trips"} - set(trips.columns)
+    if missing_columns:
+        raise ValueError(f"popularity table has no columns: {sorted(missing_columns)}")
+    if trips.duplicated(keys).any():
+        raise ValueError("popularity table contains duplicate (u, v, key) rows")
+
+    edge_keys = pd.MultiIndex.from_frame(edges[keys])
+    popularity = trips.set_index(keys)["trips"]
+    missing_keys = edge_keys.difference(popularity.index)
+    if len(missing_keys):
+        raise ValueError(f"popularity table has no data for {len(missing_keys)} edges")
+
+    result = edges.copy()
+    result["trips"] = popularity.reindex(edge_keys).to_numpy(dtype=float)
+    return result
+
+
+def _popup_value(value) -> str:
+    if pd.isna(value) or value == "":
+        return "—"
+    if isinstance(value, (float, np.floating)):
+        return _number(float(value))
+    if isinstance(value, (bool, np.bool_)):
+        return "да" if value else "нет"
+    return str(value)
+
+
+def mapped_popularity_map(
+    edges,
+    city: str,
+    *,
+    cache_dir: Path,
+    only_observed: bool = True,
+    height_px: int = 720,
+    simplify_m: float = 2.0,
+) -> folium.Map:
+    """Map edges coloured by mapped trip count, with all edge features in a click popup.
+
+    By default only edges with ``trips > 0`` are drawn. This is the mapped observation layer and is
+    much lighter than rendering the complete OSM graph; pass ``only_observed=False`` to include zeroes.
+    Geometry is simplified in the metric CRS only for browser rendering, never in the source table.
+    """
+
+    if edges.crs is None:
+        raise ValueError("edges must have a CRS")
+    mapped = _edges_with_popularity(edges, load_popularity(city, cache_dir=cache_dir))
+    if only_observed:
+        mapped = mapped[mapped["trips"] > 0].copy()
+    if mapped.empty:
+        raise ValueError("there are no mapped edges to display")
+
+    numeric = mapped["trips"].clip(lower=0.0)
+    scaled = np.log1p(numeric)
+    low, high = float(scaled.min()), float(scaled.max())
+    colours = LinearColormap(POPULARITY_COLORS, vmin=low, vmax=high if high > low else low + 1)
+    mapped["_colour"] = scaled.map(colours)
+
+    if simplify_m > 0:
+        mapped.geometry = mapped.geometry.simplify(simplify_m, preserve_topology=False)
+    mapped = mapped.to_crs("EPSG:4326")
+
+    popup_columns = [column for column in _POPULARITY_POPUP_COLUMNS if column in mapped.columns]
+    properties = mapped[[*popup_columns, "_colour", "geometry"]].copy()
+    for column in popup_columns:
+        properties[column] = properties[column].map(_popup_value)
+    geojson = json.loads(properties.to_json(drop_id=True))
+
+    fmap = folium.Map(tiles=None, control_scale=True, prefer_canvas=True, height=height_px)
+    fmap.get_root().header.add_child(Element(
+        "<style>.grey-tiles{filter:grayscale(1) brightness(1.08) contrast(.85)}</style>"
+    ))
+    for base_index, (base_name, spec) in enumerate(BASEMAPS.items()):
+        options = {key: value for key, value in spec.items() if key != "tiles"}
+        folium.TileLayer(spec["tiles"], name=base_name, show=base_index == 0, **options).add_to(fmap)
+
+    layer = folium.GeoJson(
+        geojson,
+        name="Сопоставленная популярность",
+        style_function=lambda feature: {
+            "color": feature["properties"]["_colour"],
+            "weight": 4,
+            "opacity": 0.82,
+        },
+        highlight_function=lambda _feature: {"weight": 8, "opacity": 1.0},
+        smooth_factor=1.0,
+    ).add_to(fmap)
+    folium.GeoJsonTooltip(
+        fields=["trips", "highway"],
+        aliases=["Поездок:", "highway:"],
+        sticky=False,
+    ).add_to(layer)
+    folium.GeoJsonPopup(
+        fields=popup_columns,
+        aliases=[f"{_POPULARITY_POPUP_COLUMNS[column]}:" for column in popup_columns],
+        labels=True,
+        localize=False,
+        sticky=False,
+        max_width=420,
+    ).add_to(layer)
+
+    legend = (
+        "<b>Популярность ребра, поездок</b><br>меньше "
+        f"<span style='display:inline-block;width:90px;height:9px;vertical-align:middle;"
+        f"background:linear-gradient(90deg,{','.join(POPULARITY_COLORS)})'></span> больше"
+        f"<br><span style='color:#555'>{_number(float(numeric.min()))} … "
+        f"{_number(float(numeric.max()))} (лог. шкала)</span>"
+    )
+    legend += (
+        f"<br><span style='color:#555'>{len(mapped):,} рёбер; "
+        f"сумма trips: {_number(float(numeric.sum()))}</span>"
+    ).replace(",", " ")
+    fmap.add_child(_MapControl(legend, "bottomright"))
+    folium.LayerControl(collapsed=True).add_to(fmap)
+    fmap.fit_bounds(fmap.get_bounds())
+    return fmap
+
+
 def route_feature_grid(
-    graph,
+    edges,
+    nodes,
     routes,
-    features,
     panels: list[Panel],
     start_latlon: tuple[float, float],
     end_latlon: tuple[float, float],
     *,
+    start_label: str = "старт",
+    end_label: str = "финиш",
     height_px: int = 860,
 ) -> Figure:
     """Grid of synchronised maps; each colours the same routes by a different edge feature.
 
-    ``routes`` needs ``algorithm``, ``edge_route`` and ``route_length_m``; ``features`` is
-    indexed by ``(u, v, key)`` like :func:`cycle_routing.comfort.comfort_feature_table`.
+    ``routes`` needs ``algorithm``, ``edge_route`` and ``route_length_m``; panel values are computed on
+    the rows of ``edges`` the routes pass.
     """
 
-    to_wgs84 = Transformer.from_crs(graph.graph["crs"], "EPSG:4326", always_xy=True)
-    route_edges = sorted({tuple(edge) for edges in routes["edge_route"] for edge in edges})
-    route_features = features.loc[route_edges]
+    to_wgs84 = Transformer.from_crs(edges.crs, "EPSG:4326", always_xy=True)
+    route_keys = {tuple(edge) for route in routes["edge_route"] for edge in route}
+    route_edges = edges[pd.MultiIndex.from_frame(edges[["u", "v", "key"]]).isin(route_keys)]
+    keys = list(zip(route_edges["u"], route_edges["v"], route_edges["key"]))
+    xy = nodes.set_index("node").loc[route_edges["u"], ["x", "y"]]
+    oriented_lines = {
+        key: orient_coordinates(geometry, start)
+        for key, geometry, start in zip(keys, route_edges.geometry, zip(xy["x"], xy["y"]))
+    }
     lons, lats = to_wgs84.transform(
-        route_features.geometry.bounds[["minx", "maxx"]].to_numpy().ravel(),
-        route_features.geometry.bounds[["miny", "maxy"]].to_numpy().ravel(),
+        route_edges.geometry.bounds[["minx", "maxx"]].to_numpy().ravel(),
+        route_edges.geometry.bounds[["miny", "maxy"]].to_numpy().ravel(),
     )
     bounds = [[float(np.min(lats)), float(np.min(lons))], [float(np.max(lats)), float(np.max(lons))]]
 
@@ -264,7 +454,8 @@ def route_feature_grid(
             bases[base_name] = folium.TileLayer(
                 spec["tiles"], name=base_name, show=base_index == 0, **options
             ).add_to(fmap)
-        values = route_features[panel.column]
+        values = route_edges[panel.values] if isinstance(panel.values, str) else panel.values(route_edges)
+        values = pd.Series(np.asarray(values), index=keys)
         if panel.categories:
             labels = values.astype(str)
             colours = labels.map(panel.categories).fillna("#6b7280")
@@ -287,28 +478,28 @@ def route_feature_grid(
             folium.map.CustomPane(pane, z_index=410 + order, pointer_events=True).add_to(fmap)
             name = ROUTE_LABELS.get(row.algorithm, row.algorithm)
             group = folium.FeatureGroup(name=name, overlay=True, show=True).add_to(fmap)
-            runs = _colour_runs(graph, row.edge_route, colours, labels)
+            runs = _colour_runs(oriented_lines, row.edge_route, colours, labels)
             full_line = [runs[0][2][0], *(point for run in runs for point in run[2][1:])]
-            lines = [folium.PolyLine(
+            route_lines = [folium.PolyLine(
                 _to_latlon(full_line, to_wgs84),
                 color=ROUTE_OUTLINES.get(row.algorithm, "#64748b"),
                 weight=core_weight + 2 * ring_px * (len(routes) - order),
                 opacity=1.0,
             )]
-            lines += [
+            route_lines += [
                 folium.PolyLine(
                     _to_latlon(points, to_wgs84), color=colour, weight=core_weight, opacity=1.0,
                     tooltip=f"{name}: {label}",
                 )
                 for colour, label, points in runs
             ]
-            for line in lines:
+            for line in route_lines:
                 line.options["pane"] = pane  # folium's path_options drops unknown keys such as pane
                 line.add_to(group)
             overlays[name] = group
 
-        folium.Marker(start_latlon, tooltip="старт", icon=folium.Icon(color="green", icon="play")).add_to(fmap)
-        folium.Marker(end_latlon, tooltip="финиш", icon=folium.Icon(color="red", icon="stop")).add_to(fmap)
+        folium.Marker(start_latlon, tooltip=start_label, icon=folium.Icon(color="green", icon="play")).add_to(fmap)
+        folium.Marker(end_latlon, tooltip=end_label, icon=folium.Icon(color="red", icon="stop")).add_to(fmap)
         fmap.add_child(_MapControl(legend, "bottomright"))
         if index == 0:
             fmap.add_child(_MapControl(_route_legend(routes), "bottomleft"))
