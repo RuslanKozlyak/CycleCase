@@ -14,13 +14,16 @@ dependencies = [
     "gpxpy>=1.6.2",
     "ipykernel>=6.29.5",
     "jupyterlab>=4.3.5",
+    "matplotlib>=3.9.0",
     "networkx>=3.4.2",
     "numpy>=2.1.3",
     "osmnx>=2.1.0",
     "pandas>=2.2.3",
     "pyproj>=3.7.0",
+    "pyarrow>=17.0",
     "requests>=2.32.3",
     "scipy>=1.14.1",
+    "scikit-learn>=1.6.0",
     "shapely>=2.0.6",
     "tqdm>=4.67.1",
 ]
@@ -28,10 +31,14 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+    "nbclient>=0.10",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+cycle_routing = ["assets/leaflet/*", "assets/*.html"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

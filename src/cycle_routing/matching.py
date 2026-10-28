@@ -50,7 +50,8 @@ def match_stadtradeln(
     A segment is matched by ``osm_way_id`` when a same-ID edge lies within ``osmid_max_distance_m``,
     otherwise to the nearest edge within ``geometry_max_distance_m`` (plus its reverse twin, because
     volumes have no direction). Several segments on one edge are averaged weighted by segment length.
-    Returns trips indexed like ``edges`` (0 where nothing matched) and match-quality numbers.
+    Returns trips indexed like ``edges`` (NaN where nothing matched) and match-quality numbers.
+    Zero is retained only when explicitly observed in the source.
     """
 
     cfg = config or MatchConfig()
@@ -113,7 +114,7 @@ def match_stadtradeln(
                 selected += [index for index in reverse.index[close] if index != edge_index]
             assign(match.observed_index, selected, float(match.d))
 
-    trips = np.zeros(len(table))
+    trips = np.full(len(table), np.nan)
     for edge_index, values in assignments.items():
         edge_trips, lengths = zip(*values)
         trips[edge_index] = float(np.average(edge_trips, weights=np.maximum(lengths, 0.01)))
@@ -170,9 +171,9 @@ def snap_tracks_to_edges(
 
 
 def track_edge_usage(snapped: pd.DataFrame, edges: pd.DataFrame) -> pd.Series:
-    """Number of distinct tracks passing each edge, in either direction."""
+    """Number of distinct tracks passing each edge, in either direction; NaN if unobserved."""
 
     pairs = snapped.assign(pair=[frozenset(pair) for pair in zip(snapped["u"], snapped["v"])])
     counts = pairs.drop_duplicates(["od_id", "pair"])["pair"].value_counts()
     edge_pairs = [frozenset(pair) for pair in zip(edges["u"], edges["v"])]
-    return pd.Series(counts.reindex(edge_pairs).fillna(0).to_numpy(), index=edges.index, name="trips")
+    return pd.Series(counts.reindex(edge_pairs).to_numpy(dtype=float), index=edges.index, name="trips")

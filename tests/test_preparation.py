@@ -76,7 +76,8 @@ def test_prepare_city_caches_tables_and_keeps_popularity_apart(toy_city):
     assert popularity[["u", "v", "key"]].equals(edges[["u", "v", "key"]])
     trips = popularity.set_index(["u", "v", "key"])["trips"]
     assert trips[(1, 2, 0)] == trips[(2, 1, 0)] == 120  # directionless volume on both directions
-    assert trips[(1, 5, 0)] == 0  # steps are not in the reference network
+    assert pd.isna(trips[(1, 5, 0)])  # no measurement, not a measured zero
+    assert popularity["has_observation"].equals(popularity["trips"].notna())
 
     stored = pd.read_parquet(folder / "edges.parquet")
     assert not {"trips", "stad_trips", "gpx_tracks", "popularity"} & set(stored.columns)
@@ -119,4 +120,31 @@ def test_gpx_city_counts_tracks_per_edge(toy_city):
     prepare_city("toytracks", cache_dir=cache_dir)
     trips = load_popularity("toytracks", cache_dir=cache_dir).set_index(["u", "v", "key"])["trips"]
     assert trips[(1, 2, 0)] == trips[(2, 1, 0)] == 2
-    assert trips[(1, 3, 0)] == 0
+    assert pd.isna(trips[(1, 3, 0)])
+
+
+def test_old_zero_filled_cache_is_migrated_without_changing_roads_or_od(toy_city, monkeypatch):
+    from cycle_routing import preparation
+
+    cache_dir = toy_city["cache_dir"]
+    edges, nodes = prepare_city("toytown", cache_dir=cache_dir)
+    pairs = load_od_pairs("toytown", cache_dir=cache_dir)
+    folder = cache_dir / "toytown"
+    old_popularity = load_popularity("toytown", cache_dir=cache_dir).drop(columns="has_observation").fillna({"trips": 0})
+    old_popularity.to_parquet(folder / "popularity.parquet")
+    meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+    meta["key"]["schema"] = 1
+    (folder / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    def must_preserve_tables(*args, **kwargs):
+        raise AssertionError("observation migration must not reconstruct roads or OD")
+
+    monkeypatch.setattr(preparation, "edges_table", must_preserve_tables)
+    monkeypatch.setattr(preparation, "_od_pairs", must_preserve_tables)
+    migrated_edges, migrated_nodes = prepare_city("toytown", cache_dir=cache_dir)
+    assert edges.equals(migrated_edges) and nodes.equals(migrated_nodes)
+    pd.testing.assert_frame_equal(pairs, load_od_pairs("toytown", cache_dir=cache_dir))
+    popularity = load_popularity("toytown", cache_dir=cache_dir)
+    assert popularity.trips.isna().any()
+    assert popularity.has_observation.equals(popularity.trips.notna())
+    assert len(toy_city["downloads"]) == 1

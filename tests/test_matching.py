@@ -1,9 +1,10 @@
 import geopandas as gpd
 import networkx as nx
+import pandas as pd
 from shapely.geometry import LineString
 
 from cycle_routing.config import MatchConfig
-from cycle_routing.matching import match_stadtradeln_to_graph
+from cycle_routing.matching import match_stadtradeln, match_stadtradeln_to_graph
 
 
 def _graph():
@@ -44,7 +45,7 @@ def test_id_candidate_is_rejected_when_geometry_is_far_away():
         MatchConfig(osmid_max_distance_m=10, geometry_max_distance_m=10),
     )
     assert metrics["stad_match_rate"] == 0
-    assert graph.edges[1, 2, 0]["stad_trips"] == 0
+    assert pd.isna(graph.edges[1, 2, 0]["stad_trips"])
 
 
 def test_geometry_fallback_mirrors_directionless_flow_to_reverse_edge():
@@ -71,3 +72,15 @@ def test_geometry_fallback_keeps_one_way_edge_when_reverse_is_absent():
     assert metrics["stad_match_rate"] == 1
     assert graph.number_of_edges() == 1
     assert graph.edges[1, 2, 0]["stad_trips"] == 20
+
+
+def test_matching_preserves_explicit_zero_and_leaves_unmatched_edge_unknown():
+    edges = gpd.GeoDataFrame({"u": [1, 3], "v": [2, 4], "osmid": [10, 20]},
+                            geometry=[LineString([(0, 0), (100, 0)]), LineString([(0, 100), (100, 100)])],
+                            crs="EPSG:25832")
+    observed = gpd.GeoDataFrame({"osm_way_id": [10], "number_of_matched_trips": [0]},
+                               geometry=[LineString([(0, 0), (100, 0)])], crs=edges.crs)
+    trips, metrics = match_stadtradeln(edges, observed)
+    assert trips.iloc[0] == 0
+    assert pd.isna(trips.iloc[1])
+    assert metrics["osm_edge_match_rate"] == 0.5

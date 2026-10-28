@@ -8,6 +8,7 @@ __pycache__/
 
 # Generated notebook exports
 *.html
+!src/cycle_routing/assets/*.html
 
 # Graphify working files
 graphify-out/
@@ -15,5 +16,6 @@ graphify-out/
 notebooks/data/stadtradeln_konstanz/
 notebooks/data/osm/
 notebooks/data/cities/
+notebooks/data/hackathon/
 outputs/
 .tmp/

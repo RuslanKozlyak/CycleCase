@@ -253,6 +253,7 @@ def popularity(city: str, *, cache_dir: Path) -> Callable[[pd.DataFrame], pd.Ser
 
 _POPULARITY_POPUP_COLUMNS = {
     "trips": "Поездок",
+    "has_observation": "Есть измерение",
     "u": "Начальный узел (u)",
     "v": "Конечный узел (v)",
     "key": "Ключ ребра",
@@ -290,6 +291,11 @@ def _edges_with_popularity(edges, trips: pd.DataFrame):
 
     result = edges.copy()
     result["trips"] = popularity.reindex(edge_keys).to_numpy(dtype=float)
+    result["has_observation"] = result["trips"].notna()
+    if "has_observation" in trips:
+        source_flags = trips.set_index(keys)["has_observation"].reindex(edge_keys).to_numpy(dtype=bool)
+        if not np.array_equal(source_flags, result["has_observation"].to_numpy()):
+            raise ValueError("has_observation must agree with nonmissing trip counts")
     return result
 
 
@@ -314,24 +320,27 @@ def mapped_popularity_map(
 ) -> folium.Map:
     """Map edges coloured by mapped trip count, with all edge features in a click popup.
 
-    By default only edges with ``trips > 0`` are drawn. This is the mapped observation layer and is
-    much lighter than rendering the complete OSM graph; pass ``only_observed=False`` to include zeroes.
+    By default all known counts, including explicit zeroes, are drawn. Pass ``only_observed=False``
+    to also show unmeasured roads in dashed grey. Unknown counts are never coloured as zero.
     Geometry is simplified in the metric CRS only for browser rendering, never in the source table.
     """
 
     if edges.crs is None:
         raise ValueError("edges must have a CRS")
     mapped = _edges_with_popularity(edges, load_popularity(city, cache_dir=cache_dir))
+    positive_count = int(mapped["trips"].gt(0).sum())
+    zero_count = int(mapped["trips"].eq(0).sum())
+    missing_count = int(mapped["trips"].isna().sum())
     if only_observed:
-        mapped = mapped[mapped["trips"] > 0].copy()
+        mapped = mapped[mapped["has_observation"]].copy()
     if mapped.empty:
         raise ValueError("there are no mapped edges to display")
 
     numeric = mapped["trips"].clip(lower=0.0)
     scaled = np.log1p(numeric)
-    low, high = float(scaled.min()), float(scaled.max())
+    low, high = (float(scaled.min()), float(scaled.max())) if numeric.notna().any() else (0.0, 0.0)
     colours = LinearColormap(POPULARITY_COLORS, vmin=low, vmax=high if high > low else low + 1)
-    mapped["_colour"] = scaled.map(colours)
+    mapped["_colour"] = scaled.map(lambda value: colours(value) if pd.notna(value) else "#9ca3af")
 
     if simplify_m > 0:
         mapped.geometry = mapped.geometry.simplify(simplify_m, preserve_topology=False)
@@ -341,6 +350,7 @@ def mapped_popularity_map(
     properties = mapped[[*popup_columns, "_colour", "geometry"]].copy()
     for column in popup_columns:
         properties[column] = properties[column].map(_popup_value)
+    properties.loc[~mapped["has_observation"], "trips"] = "нет данных"
     geojson = json.loads(properties.to_json(drop_id=True))
 
     fmap = folium.Map(tiles=None, control_scale=True, prefer_canvas=True, height=height_px)
@@ -356,8 +366,9 @@ def mapped_popularity_map(
         name="Сопоставленная популярность",
         style_function=lambda feature: {
             "color": feature["properties"]["_colour"],
-            "weight": 4,
-            "opacity": 0.82,
+            "weight": 4 if feature["properties"]["has_observation"] == "да" else 2,
+            "opacity": 0.82 if feature["properties"]["has_observation"] == "да" else 0.45,
+            "dashArray": None if feature["properties"]["has_observation"] == "да" else "4,4",
         },
         highlight_function=lambda _feature: {"weight": 8, "opacity": 1.0},
         smooth_factor=1.0,
@@ -386,6 +397,8 @@ def mapped_popularity_map(
     legend += (
         f"<br><span style='color:#555'>{len(mapped):,} рёбер; "
         f"сумма trips: {_number(float(numeric.sum()))}</span>"
+        f"<br>Положительные: {positive_count:,}; явный ноль: {zero_count:,}"
+        f"<br>Без измерения: {missing_count:,}" + (" (скрыты)" if only_observed else " (серый пунктир)")
     ).replace(",", " ")
     fmap.add_child(_MapControl(legend, "bottomright"))
     folium.LayerControl(collapsed=True).add_to(fmap)
@@ -461,13 +474,16 @@ def route_feature_grid(
             colours = labels.map(panel.categories).fillna("#6b7280")
             legend = _category_legend(panel, set(labels))
         else:
-            numeric = values.astype(float).fillna(0.0)
+            numeric = values.astype(float)
             scaled = np.log1p(numeric) if panel.log else numeric
-            low, high = float(scaled.min()), float(scaled.max())
+            low, high = (float(scaled.min()), float(scaled.max())) if numeric.notna().any() else (0.0, 0.0)
             colormap = LinearColormap(panel.colors, vmin=low, vmax=high if high > low else low + 1)
-            colours = scaled.map(colormap)
-            labels = numeric.map(lambda value: f"{value:.3g}")
-            legend = _gradient_legend(panel, float(numeric.min()), float(numeric.max()))
+            colours = scaled.map(lambda value: colormap(value) if pd.notna(value) else "#9ca3af")
+            labels = numeric.map(lambda value: f"{value:.3g}" if pd.notna(value) else "нет данных")
+            legend = (_gradient_legend(panel, float(numeric.min()), float(numeric.max()))
+                      if numeric.notna().any() else f"<b>{html.escape(panel.title)}</b>")
+            if numeric.isna().any():
+                legend += "<br><span style='color:#9ca3af'>Серый: нет данных</span>"
         colours, labels = colours.to_dict(), labels.to_dict()
 
         overlays = {}

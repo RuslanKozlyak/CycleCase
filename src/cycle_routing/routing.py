@@ -32,7 +32,6 @@ from tqdm.auto import tqdm
 
 from .config import OSM_WAY_TAGS, TurnConfig
 from .graph import WEIGHT, build_graph, edge_costs
-from .preparation import SCHEMA_VERSION
 
 
 SEARCH = {"dijkstra": nx.dijkstra_path, "bellman_ford": nx.bellman_ford_path, "astar": nx.astar_path}
@@ -44,6 +43,9 @@ TURNS = {
 
 EdgeKey = tuple[int, int, int]
 ROUTE_COLUMNS = ["od_id", "algorithm", "edge_route", "route_length_m", "turns", "geometry"]
+# Observation-table migrations do not alter routes: keys already hash roads, costs,
+# OD, turns and search. Keep their version independent of preparation.SCHEMA_VERSION.
+ROUTE_CACHE_VERSION = 1
 
 
 def orient_coordinates(geometry, start_xy: tuple[float, float]) -> list[tuple[float, float]]:
@@ -221,7 +223,7 @@ def _preset_routes(edges, nodes, pairs, algorithm: str, preset: dict, cache_dir:
     path = None
     if cache_dir is not None:
         key = json.dumps({
-            "schema": SCHEMA_VERSION,
+            "schema": ROUTE_CACHE_VERSION,
             "tags": list(OSM_WAY_TAGS),
             "edges": _digest(edges["u"], edges["v"], edges["key"], edges["length_m"]),
             "cost": _digest(cost),

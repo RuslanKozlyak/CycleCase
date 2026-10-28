@@ -1,13 +1,18 @@
 import networkx as nx
 import pandas as pd
+import pytest
 from shapely.geometry import LineString
 
+from cycle_routing import observed_area, prepare_city
 from cycle_routing.comfort import comfort_feature_table
 from cycle_routing.evaluation import (
+    comfort_correlation,
     composition_table,
+    edge_trips,
     route_edge_association,
     route_edge_value_sums,
     route_edges_long,
+    weighted_corr,
 )
 
 
@@ -56,3 +61,52 @@ def test_route_edge_value_sums_all_trips_and_counts_repeated_edges():
 
     result = route_edge_value_sums(edge_rows, features, "trips")
     assert result.to_dict() == {"mine": 40.0, "other": 20.0}
+
+
+def test_observed_area_keeps_every_observed_edge_and_drops_the_unsurveyed(toy_city):
+    edges, _ = prepare_city("toytown", cache_dir=toy_city["cache_dir"])
+    trips = edge_trips(edges, "toytown", cache_dir=toy_city["cache_dir"])
+
+    assert observed_area(edges, "toytown", cache_dir=toy_city["cache_dir"]).all()
+
+    # A grid far finer than the town: only the surveyed roads stay inside.
+    tight = observed_area(edges, "toytown", cache_dir=toy_city["cache_dir"], cell_m=5.0, dilate=1)
+    assert tight[trips > 0].all(), "an edge with observed trips must never fall outside the area"
+    assert not tight.all(), "the steps and the private driveway carry no observations"
+
+
+def test_comfort_correlation_follows_the_observed_streets(toy_city):
+    """In the toy town the cycleway carries the trips and the primary does not."""
+
+    cache_dir = toy_city["cache_dir"]
+    edges, _ = prepare_city("toytown", cache_dir=cache_dir)
+
+    def weights(cycleway: float, primary: float):
+        # "cycleway;path" is one value of a joined tag, so match on the first token.
+        def cost(frame):
+            classes = frame["highway"].str.split(";").str[0]
+            return frame["length_m"] * classes.map({"cycleway": cycleway, "primary": primary}).fillna(1.0)
+
+        return cost
+
+    likes_cycleways = comfort_correlation(edges, weights(0.25, 4.0), "toytown", cache_dir=cache_dir)
+    likes_primaries = comfort_correlation(edges, weights(4.0, 0.25), "toytown", cache_dir=cache_dir)
+
+    assert likes_cycleways > 0.5
+    # Reciprocal weights negate every comfort, so the correlation flips sign and keeps its size.
+    assert likes_primaries == pytest.approx(-likes_cycleways)
+    # Cost proportional to length says nothing about any street.
+    assert pd.isna(comfort_correlation(edges, "length_m", "toytown", cache_dir=cache_dir))
+
+
+def test_unknown_trip_sum_remains_unknown_and_explicit_zero_remains_zero():
+    features = pd.DataFrame({"trips": [float("nan"), 0.]},
+                            index=pd.MultiIndex.from_tuples([(1, 2, 0), (2, 3, 0)], names=["u", "v", "key"]))
+    rows = pd.DataFrame({"group": ["unknown", "zero"], "u": [1, 2], "v": [2, 3], "key": [0, 0]})
+    result = route_edge_value_sums(rows, features, "trips")
+    assert pd.isna(result["unknown"])
+    assert result["zero"] == 0
+
+
+def test_correlation_excludes_unknown_target_instead_of_zero_filling():
+    assert weighted_corr([1., 2., 1000.], [1., 2., float("nan")], [1., 1., 100000.]) == pytest.approx(1)

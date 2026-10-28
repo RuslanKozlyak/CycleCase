@@ -9,7 +9,7 @@ Students write a filter mask, a comfort function, and optionally a turn model an
 
 from .comfort import comfort_components, comfort_factors, comfort_feature_table, default_comfort
 from .config import DEFAULT_COMFORT_CONFIG, TurnConfig, with_overrides
-from .evaluation import score
+from .evaluation import comfort_correlation, comfort_scores, edge_trips, score
 from .graph import (
     ConnectivityWarning,
     build_graph,
@@ -22,7 +22,16 @@ from .graph import (
     restore_connectors,
     rideability_issues,
 )
-from .preparation import CITIES, EDGE_COLUMNS, load_od_pairs, make_edges, make_nodes, prepare_city, preparation_report
+from .preparation import (
+    CITIES,
+    EDGE_COLUMNS,
+    load_od_pairs,
+    make_edges,
+    make_nodes,
+    observed_area,
+    prepare_city,
+    preparation_report,
+)
 from .presets import COMFORT_PRESETS, cost_overview
 from .routing import SEARCH, TURNS, build_routes, count_turns, edge_bearings, find_route, turn_graph, turn_kind, turn_penalty
 from .tags import has_any

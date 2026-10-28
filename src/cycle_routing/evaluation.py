@@ -1,7 +1,7 @@
 """Stage 5 - score: metrics of ready routes. A black box for students.
 
 ``score(routes, city, cache_dir=...)`` reads the city's cached observations itself; the functions below
-are its insides. Only this module and the maps look at popularity.
+are its insides. ML experiments may additionally use training labels, kept outside the routing graph.
 """
 
 from __future__ import annotations
@@ -14,16 +14,29 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from .comfort import comfort_feature_table
-from .graph import RIDEABILITY_REASON_LABELS, rideability_issues
+from .graph import RIDEABILITY_REASON_LABELS, edge_costs, is_rideable, rideability_issues
 from .matching import sample_geometry
 from .preparation import (
     CITIES,
     StadtradelnSource,
     load_observations,
     load_popularity,
+    observed_area,
     prepare_city,
     reference_mask,
 )
+
+
+def weighted_corr(x, y, weights) -> float:
+    """Pearson correlation of two edge values, weighted by edge length; NaN when either is constant."""
+
+    x, y, weights = (np.asarray(values, dtype=float) for values in (x, y, weights))
+    keep = np.isfinite(x) & np.isfinite(y) & np.isfinite(weights) & (weights > 0)
+    if keep.sum() < 2 or np.ptp(x[keep]) == 0 or np.ptp(y[keep]) == 0:
+        return float("nan")
+    cov = np.cov(x[keep], y[keep], aweights=weights[keep])
+    spread = cov[0, 0] * cov[1, 1]
+    return float(cov[0, 1] / np.sqrt(spread)) if spread > 0 else float("nan")
 
 
 def evaluate_corridor_popularity(
@@ -86,11 +99,58 @@ def route_edges_long(routes: pd.DataFrame, features: pd.DataFrame) -> pd.DataFra
 
 
 def route_edge_value_sums(edge_rows: pd.DataFrame, features: pd.DataFrame, column: str) -> pd.Series:
-    """Sum an edge value over every traversed edge, including repeated uses across routes."""
+    """Sum known values over traversed edges; NaN when a model has no measured values."""
 
     index = pd.MultiIndex.from_frame(edge_rows[["u", "v", "key"]])
-    values = features[column].reindex(index).fillna(0.0).to_numpy()
-    return pd.Series(values, index=edge_rows.index).groupby(edge_rows["group"], sort=False).sum()
+    values = features[column].reindex(index).to_numpy()
+    return pd.Series(values, index=edge_rows.index).groupby(edge_rows["group"], sort=False).sum(min_count=1)
+
+
+def route_popularity_metrics(
+    routes: pd.DataFrame,
+    edges: pd.DataFrame,
+    trips: pd.Series,
+    *,
+    mask: pd.Series,
+    popular_threshold: float | None = None,
+) -> pd.DataFrame:
+    """Per-route length-weighted mean log(1 + trips) on a chosen evaluation partition.
+
+    Missing labels are always excluded, even if ``mask`` includes them. Unsurveyed/training
+    streets are not treated as zero-popularity test streets. Report
+    coverage explicitly: routes without evaluated length get NaN, never a fabricated score.
+    Segmentation and repeated edges cannot inflate a raw trip-count sum here.
+    """
+
+    if not trips.index.equals(edges.index) or not mask.index.equals(edges.index) or mask.isna().any():
+        raise ValueError("Trips and evaluation mask must be aligned with edges")
+    mask = mask & trips.notna()
+    selected = trips.loc[mask]
+    if not np.isfinite(selected).all() or (selected < 0).any():
+        raise ValueError("Evaluation trips must be finite and nonnegative")
+    features = edges[["u", "v", "key", "length_m"]].assign(
+        log_trips=np.log1p(trips.where(mask)), evaluate=mask,
+    ).set_index(["u", "v", "key"])
+    if not features.index.is_unique:
+        raise ValueError("Edge identifiers must be unique")
+    rows = []
+    for route in routes.itertuples():
+        path = pd.MultiIndex.from_tuples([tuple(edge) for edge in route.edge_route], names=["u", "v", "key"])
+        used = features.reindex(path)
+        if used["length_m"].isna().any():
+            raise ValueError("A route contains edges missing from the evaluation table")
+        evaluated = used.loc[used["evaluate"].astype(bool)]
+        length = float(used["length_m"].sum())
+        covered = float(evaluated["length_m"].sum())
+        value = float(np.average(evaluated["log_trips"], weights=evaluated["length_m"])) if covered else np.nan
+        rows.append({
+            "od_id": route.od_id, "algorithm": route.algorithm,
+            "route_length_m": length, "popularity_log_mean": value,
+            "coverage_pct": 100 * covered / length if length else 0.0,
+            "popular_edge_share": (float(evaluated.loc[evaluated.log_trips.ge(np.log1p(popular_threshold)), "length_m"].sum() / covered)
+                                   if covered and popular_threshold is not None else np.nan),
+        })
+    return pd.DataFrame(rows)
 
 
 def composition_table(edge_rows: pd.DataFrame, features: pd.DataFrame, column: str) -> pd.DataFrame:
@@ -114,7 +174,7 @@ def route_edge_association(
     of a street count as one edge.
     """
 
-    streets = features[[value_column, "length_m", "geometry"]].copy()
+    streets = features.loc[features[value_column].notna(), [value_column, "length_m", "geometry"]].copy()
     streets["pair"] = [frozenset(pair) for pair in zip(streets.index.get_level_values("u"), streets.index.get_level_values("v"))]
     streets = streets.sort_values(value_column, ascending=False).drop_duplicates("pair").set_index("pair")
     rows = []
@@ -132,14 +192,79 @@ def route_edge_association(
                 "log_value": np.log1p(corridor[value_column].to_numpy()),
             }))
 
-    def weighted_corr(frame):
-        cov = np.cov(frame["selected"], frame["log_value"], aweights=frame["length_m"])
-        return float(cov[0, 1] / np.sqrt(cov[0, 0] * cov[1, 1]))
-
     pooled = pd.concat(rows)
     return pd.Series(
-        {algorithm: weighted_corr(frame) for algorithm, frame in pooled.groupby("algorithm", sort=False)},
+        {
+            algorithm: weighted_corr(frame["selected"], frame["log_value"], frame["length_m"])
+            for algorithm, frame in pooled.groupby("algorithm", sort=False)
+        },
         name="corr_selected_vs_log_popularity",
+    )
+
+
+def edge_trips(edges: pd.DataFrame, city: str, *, cache_dir: Path) -> pd.Series:
+    """Observed trips aligned with ``edges``; works on a filtered subset of the city's table."""
+
+    popularity = load_popularity(city, cache_dir=cache_dir)
+    values = pd.Series(
+        popularity["trips"].to_numpy(), index=pd.MultiIndex.from_frame(popularity[["u", "v", "key"]])
+    )
+    aligned = values.reindex(pd.MultiIndex.from_frame(edges[["u", "v", "key"]]))
+    return pd.Series(aligned.to_numpy(), index=edges.index, name="trips")
+
+
+def comfort_correlation(
+    edges: gpd.GeoDataFrame,
+    cost,
+    city: str,
+    *,
+    cache_dir: Path,
+    mask: pd.Series | None = None,
+) -> float:
+    """How well a comfort function explains observed popularity, edge by edge.
+
+    The comfort of an edge is ``-log(cost / length_m)``: its price per metre, with length divided out
+    because length is not a preference, and on a log scale because comfort weights multiply. The
+    result is that comfort correlated with ``log1p(trips)``, weighted by edge length, over ``mask`` -
+    by default the rideable edges of :func:`observed_area`. Unlike :func:`score` this looks at the
+    whole network instead of a handful of routes, so two profiles that happen to pick the same route
+    still get different numbers. ``cost`` is anything :func:`edge_costs` accepts.
+
+    A cost proportional to length is the same everywhere and explains nothing: the result is NaN.
+    """
+
+    if mask is None:
+        mask = observed_area(edges, city, cache_dir=cache_dir) & is_rideable(edges)
+    length = edges["length_m"].to_numpy()
+    comfort = -np.log(edge_costs(edges, cost).to_numpy() / length)
+    trips = edge_trips(edges, city, cache_dir=cache_dir).to_numpy()
+    keep = np.asarray(mask, dtype=bool) & np.isfinite(comfort) & np.isfinite(trips)
+    if keep.sum() < 2:
+        return float("nan")
+    return weighted_corr(comfort[keep], np.log1p(trips[keep]), length[keep])
+
+
+def comfort_scores(
+    edges: gpd.GeoDataFrame,
+    presets: dict[str, dict],
+    city: str,
+    *,
+    cache_dir: Path,
+) -> pd.Series:
+    """:func:`comfort_correlation` for every preset, labelled as in :func:`score`.
+
+    The edge mask is built once and reused, so adding a profile costs one pass over the table.
+    """
+
+    mask = observed_area(edges, city, cache_dir=cache_dir) & is_rideable(edges)
+    return pd.Series(
+        {
+            preset.get("label", name): comfort_correlation(
+                edges, preset["cost"], city, cache_dir=cache_dir, mask=mask
+            )
+            for name, preset in presets.items()
+        },
+        name="связь комфорта с популярностью",
     )
 
 
@@ -152,27 +277,27 @@ def edge_kind_counts(edge_rows: pd.DataFrame, edges: pd.DataFrame) -> pd.DataFra
     return kinds.groupby(edge_rows["group"].to_numpy()).sum()
 
 
-def _stadtradeln_scores(routes, city, cache_dir, streets, models) -> pd.DataFrame:
+def _stadtradeln_scores(routes, city, features, streets, models) -> pd.DataFrame:
     source = CITIES[city].observations
-    observed = load_observations(city, cache_dir=cache_dir)
-    metrics = evaluate_corridor_popularity(
-        routes,
-        observed,
-        popular_threshold=float(observed["trips"].quantile(source.popular_quantile)),
-        sample_step_m=source.sample_step_m,
-        match_distance_m=source.match_distance_m,
-    )
+    flat = features.reset_index()
+    metrics = route_popularity_metrics(routes, flat, flat["trips"], mask=flat["trips"].notna(),
+                                       popular_threshold=float(flat["trips"].quantile(source.popular_quantile)))
+    metrics = metrics.merge(routes[["od_id", "algorithm", "turns"]], on=["od_id", "algorithm"], validate="one_to_one")
     comparison = compare_route_models(metrics)
     gain = comparison.groupby("model")["popularity_gain"]
     by_model = metrics.groupby("algorithm")
+    ratios = np.exp(gain.median()).reindex(models)
+    if metrics.loc[metrics.algorithm.eq("shortest"), "popularity_log_mean"].notna().any():
+        ratios.loc["shortest"] = 1.0
     return pd.DataFrame({
         "объезд, %": comparison.groupby("model")["detour_pct"].median(),
         "поворотов": by_model["turns"].median(),
-        "поездок × кратчайший": np.exp(gain.median()),
+        "поездок × кратчайший": ratios,
         "популярные улицы, %": 100 * by_model["popular_edge_share"].median(),
-        "популярнее кратчайшего": gain.apply(lambda g: f"{(g > 0).sum()}/{len(g)}"),
+        "популярнее кратчайшего": gain.apply(lambda g: f"{(g > 0).sum()}/{g.notna().sum()}"),
         "связь с популярностью": route_edge_association(routes, streets, "trips"),
-    }).reindex(models).fillna({"объезд, %": 0.0, "поездок × кратчайший": 1.0})
+        "покрытие измерениями, %": by_model["coverage_pct"].median(),
+    }).reindex(models).fillna({"объезд, %": 0.0})
 
 
 def _track_scores(routes, city, features, edge_rows, models) -> pd.DataFrame:
@@ -221,12 +346,12 @@ def score(routes: gpd.GeoDataFrame, city: str, *, cache_dir: Path) -> pd.DataFra
     edge_rows = route_edges_long(routes, features)
 
     if isinstance(CITIES[city].observations, StadtradelnSource):
-        table = _stadtradeln_scores(routes, city, cache_dir, streets, models)
+        table = _stadtradeln_scores(routes, city, features, streets, models)
     else:
         table = _track_scores(routes, city, features, edge_rows, models)
     trip_sums = route_edge_value_sums(edge_rows, features, "trips").rename("сумма поездок по рёбрам")
     return (
         table
-        .join(trip_sums.reindex(models, fill_value=0.0))
+        .join(trip_sums.reindex(models))
         .join(edge_kind_counts(edge_rows, base).reindex(models, fill_value=0))
     )

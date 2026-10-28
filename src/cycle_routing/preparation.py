@@ -5,7 +5,7 @@ reference set of edges and caches everything in ``<cache_dir>/<city>/``:
 
     edges.parquet         the table students work with (EDGE_COLUMNS); nothing derived from trips
     nodes.parquet         node coordinates (NODE_COLUMNS)
-    popularity.parquet    u, v, key, trips   - read only by score() and the maps
+    popularity.parquet    u, v, key, trips, has_observation; unknown trips are NaN
     observations.parquet  observed segments or GPS tracks - read only by score() and the maps
     od_pairs.parquet      fixed start/finish pairs of the city
     meta.json             cache key and preparation report; written last
@@ -37,13 +37,13 @@ import shapely
 from .config import OSM_WAY_TAGS, GraphConfig, MatchConfig
 from .data import load_clean_personal_gpx, load_stadtradeln
 from .graph import ConnectivityWarning, build_graph, is_rideable, largest_component
-from .matching import match_stadtradeln, snap_tracks_to_edges, track_edge_usage
+from .matching import match_stadtradeln, sample_geometry, snap_tracks_to_edges, track_edge_usage
 from .tags import first_number, join_values, tag_values
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # Bump when the tables are built differently: every city cache is rebuilt (the GraphML is kept).
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Edge table column -> OSM tags merged into it (cycleway:* counts as one feature).
 TAG_COLUMNS = {
@@ -59,7 +59,7 @@ TAG_COLUMNS = {
 NUMBER_COLUMNS = ("maxspeed", "lanes", "width")
 EDGE_COLUMNS = ("u", "v", "key", "length_m", *TAG_COLUMNS, *NUMBER_COLUMNS, "oneway", "geometry")
 NODE_COLUMNS = ("node", "x", "y", "geometry")
-POPULARITY_COLUMNS = ("u", "v", "key", "trips")
+POPULARITY_COLUMNS = ("u", "v", "key", "trips", "has_observation")
 CACHE_FILES = ("edges", "nodes", "popularity", "observations", "od_pairs")
 _GEO_FILES = {"edges", "nodes", "observations"}
 
@@ -390,6 +390,39 @@ def reference_mask(edges: pd.DataFrame, city: str) -> pd.Series:
     return mask
 
 
+def observed_area(
+    edges: gpd.GeoDataFrame,
+    city: str,
+    *,
+    cache_dir: Path,
+    cell_m: float = 250.0,
+    dilate: int = 1,
+) -> pd.Series:
+    """Approximate geographic footprint of observations, not a mask of known trip counts.
+
+    Use this mask for geographic scope and fixed spatial partitions. An edge near an observation
+    can still have no matched count. For training and evaluation also require ``trips.notna()``;
+    only explicit source zeroes are zero labels. Roads without labels remain available for routing.
+
+    Observations are sampled along their length onto a ``cell_m`` grid; ``dilate`` grows the marked
+    set by that many cells, so a quiet side street beside a surveyed road stays inside. An edge
+    belongs to the area when its own midpoint falls in a marked cell.
+    """
+
+    observed = load_observations(city, cache_dir=cache_dir).to_crs(edges.crs)
+    marked = {
+        (int(point.x // cell_m), int(point.y // cell_m))
+        for geometry in observed.geometry
+        for point in sample_geometry(geometry, cell_m / 2)
+    }
+    if dilate:
+        steps = range(-dilate, dilate + 1)
+        marked = {(x + dx, y + dy) for x, y in marked for dx in steps for dy in steps}
+    midpoints = edges.geometry.interpolate(0.5, normalized=True)
+    cells = zip((midpoints.x // cell_m).astype(int), (midpoints.y // cell_m).astype(int))
+    return pd.Series([cell in marked for cell in cells], index=edges.index, name="observed_area")
+
+
 def nodes_near_observations(graph, observed: gpd.GeoDataFrame, max_distance_m: float = 25.0):
     """Return graph-node IDs inside the spatial support of observed edges."""
 
@@ -526,18 +559,35 @@ def prepare_city(city: str, *, cache_dir: Path, refresh: bool = False) -> tuple[
     if not refresh and _is_cached(folder, city):
         return _read(folder, "edges"), _read(folder, "nodes")
 
+    # Schema 1 -> 2 changes observation semantics only. Preserve roads and OD exactly,
+    # rematching labels from the same raw OSM cache instead of rebuilding the street tables.
+    migrate_labels = False
+    if not refresh and SCHEMA_VERSION == 2 and (folder / "meta.json").exists():
+        previous_key = json.loads((folder / "meta.json").read_text(encoding="utf-8")).get("key", {})
+        migrate_labels = (previous_key.get("schema") == 1
+                          and {**previous_key, "schema": SCHEMA_VERSION} == cache_key(city)
+                          and all((folder / f"{name}.parquet").exists() for name in CACHE_FILES))
     raw = load_raw_graph(folder, city, refresh=refresh)
-    edges, osmids = edges_table(raw, spec.crs)
-    nodes = nodes_table(raw, spec.crs)
+    if migrate_labels:
+        edges, nodes = _read(folder, "edges"), _read(folder, "nodes")
+        osmids = pd.Series([raw.edges[tuple(key)].get("osmid")
+                           for key in edges[["u", "v", "key"]].itertuples(index=False, name=None)], index=edges.index)
+        pairs = _read(folder, "od_pairs")
+    else:
+        edges, osmids = edges_table(raw, spec.crs)
+        nodes = nodes_table(raw, spec.crs)
+        pairs = None
     del raw
     validate_edges(edges)
 
     reference_rows = reference_mask(edges, city)
     reference = edges[reference_rows]
     trips, observations, report = _observe(city, folder, reference, osmids[reference_rows])
-    popularity = pd.DataFrame({"u": edges["u"], "v": edges["v"], "key": edges["key"], "trips": 0.0})
+    popularity = pd.DataFrame({"u": edges["u"], "v": edges["v"], "key": edges["key"], "trips": np.nan})
     popularity.loc[trips.index, "trips"] = trips.to_numpy(dtype=float)
-    pairs = _od_pairs(city, reference, nodes, observations)
+    popularity["has_observation"] = popularity["trips"].notna()
+    if pairs is None:
+        pairs = _od_pairs(city, reference, nodes, observations)
 
     (folder / "meta.json").unlink(missing_ok=True)
     edges.to_parquet(folder / "edges.parquet")
@@ -550,6 +600,10 @@ def prepare_city(city: str, *, cache_dir: Path, refresh: bool = False) -> tuple[
         "nodes": len(nodes),
         "reference_edges": int(reference_rows.sum()),
         "od_pairs": len(pairs),
+        "observed_edges": int(popularity["has_observation"].sum()),
+        "positive_edges": int(popularity["trips"].gt(0).sum()),
+        "zero_edges": int(popularity["trips"].eq(0).sum()),
+        "unknown_edges": int(popularity["trips"].isna().sum()),
         **report,
     }
     meta = {"key": cache_key(city), "report": report}
@@ -571,7 +625,7 @@ def load_od_pairs(city: str, *, cache_dir: Path) -> pd.DataFrame:
 
 
 def load_popularity(city: str, *, cache_dir: Path) -> pd.DataFrame:
-    """Observed trips per edge (u, v, key, trips), in the order of ``edges``. For metrics and maps only."""
+    """Counts and provenance per edge: NaN means no measurement, explicit zero means zero observed."""
 
     return _cached_table(city, cache_dir, "popularity")
 
