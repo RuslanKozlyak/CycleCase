@@ -11,7 +11,7 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from .comfort import comfort_feature_table
 from .graph import RIDEABILITY_REASON_LABELS, edge_costs, is_rideable, rideability_issues

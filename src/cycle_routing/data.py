@@ -10,7 +10,7 @@ import gpxpy
 from pyproj import Geod
 import requests
 from shapely.geometry import LineString
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 
 GEOD = Geod(ellps="WGS84")
@@ -61,8 +61,13 @@ def load_clean_personal_gpx(
     bounds: tuple[float, float, float, float] = (29.40, 59.55, 30.90, 60.35),
     max_speed_kmh: float = 80.0,
     max_gap_seconds: float = 600.0,
+    max_jump_m: float = 150.0,
 ) -> gpd.GeoDataFrame:
-    """Drop out-of-city, duplicate, non-monotonic, and implausible GPX points."""
+    """Drop out-of-city, duplicate, non-monotonic, and implausible GPX points.
+
+    A jump longer than ``max_jump_m`` between kept points (lost signal, the logger paused) starts a new
+    line instead of a straight "teleport" across the city; all lines of a segment keep its ``activity_id``.
+    """
 
     records = []
     min_lon, min_lat, max_lon, max_lat = bounds
@@ -71,7 +76,7 @@ def load_clean_personal_gpx(
             gpx = gpxpy.parse(stream)
         for track_index, track in enumerate(gpx.tracks, 1):
             for segment_index, segment in enumerate(track.segments, 1):
-                kept = []
+                parts, kept = [], []
                 for point in segment.points:
                     if not (min_lon <= point.longitude <= max_lon and min_lat <= point.latitude <= max_lat):
                         continue
@@ -92,13 +97,18 @@ def load_clean_personal_gpx(
                                 and 3.6 * abs(distance_m) / seconds > max_speed_kmh
                             ):
                                 continue
+                        if abs(distance_m) > max_jump_m:
+                            parts.append(kept)
+                            kept = []
                     kept.append(point)
-                if len(kept) >= 2:
-                    records.append(
-                        {
-                            "activity_id": f"{path.stem}:T{track_index}:S{segment_index}",
-                            "file": path.name,
-                            "geometry": LineString([(p.longitude, p.latitude) for p in kept]),
-                        }
-                    )
+                parts.append(kept)
+                for part in parts:
+                    if len(part) >= 2:
+                        records.append(
+                            {
+                                "activity_id": f"{path.stem}:T{track_index}:S{segment_index}",
+                                "file": path.name,
+                                "geometry": LineString([(p.longitude, p.latitude) for p in part]),
+                            }
+                        )
     return gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")

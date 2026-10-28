@@ -9,6 +9,7 @@ description = "Exploration and visualization of cycling GPX tracks"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "cloudpickle>=3.0",
     "folium>=0.18.0",
     "geopandas>=1.0.1",
     "gpxpy>=1.6.2",

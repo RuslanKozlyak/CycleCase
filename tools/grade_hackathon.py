@@ -1,36 +1,35 @@
-"""Organizer grades submitted routes using withheld test labels and an independent shortest path."""
+"""Organizer: score all team submissions in a folder on the closed zone (same as notebooks/hackathon_grading.ipynb).
+
+    python tools/grade_hackathon.py outputs/hackathon/submissions --pack konstanz_more
+
+Every subfolder or ZIP in the folder is one team (the folder written by export_solution).
+"""
 from pathlib import Path
 import argparse
-import json
 import sys
-import geopandas as gpd
-import pandas as pd
 
-ROOT=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(ROOT/"src"))
-from cycle_routing.workshop import load_lab,evaluate_routes,EvaluationRules
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT/"src"))
+from cycle_routing.grading import grade_all, load_submissions, submissions_table
+from cycle_routing.workshop import load_city
 
 
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("submission",type=Path)
-    parser.add_argument("--data",type=Path,default=ROOT/"notebooks/data/hackathon/konstanz")
-    parser.add_argument("--private",type=Path,default=ROOT/"outputs/hackathon_private/konstanz")
-    args=parser.parse_args()
-    lab=load_lab(args.data)
-    metadata=json.loads((args.submission/"submission.json").read_text(encoding="utf-8"))
-    private=json.loads((args.private/"dataset.json").read_text(encoding="utf-8"))
-    if metadata["dataset_id"]!=lab.manifest["dataset_id"] or private["dataset_id"]!=lab.manifest["dataset_id"]:
-        raise ValueError("Submission and test labels refer to another dataset")
-    routes=gpd.read_parquet(args.submission/"routes.parquet")
-    if set(routes.algorithm)!={metadata["algorithm"]}:raise ValueError("Unexpected algorithms in submission")
-    result=evaluate_routes(lab,routes,split="test",labels=pd.read_parquet(args.private/"test_labels.parquet"),
-                           rules=EvaluationRules(),solutions={metadata["algorithm"]:{}})
-    result.table.to_csv(args.submission/"test_score.csv")
-    result.per_od.to_csv(args.submission/"test_per_od.csv",index=False)
-    print(result.table.round(3).to_string())
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("submissions", type=Path)
+    parser.add_argument("--pack", default="konstanz_more")
+    args = parser.parse_args()
+    lab = load_city(ROOT/"notebooks/data/hackathon"/args.pack)
+    teams = load_submissions(args.submissions, lab)
+    print(submissions_table(teams).to_string())
+    board = grade_all(lab, ROOT/"outputs/hackathon_private"/args.pack, teams)
+    board.table.to_csv(args.submissions/"leaderboard.csv")
+    print("\n" + board.table.to_string())
+    if len(board.errors):
+        print("\n" + board.errors.to_string())
 
 
-if __name__=="__main__":main()
+if __name__ == "__main__":
+    main()

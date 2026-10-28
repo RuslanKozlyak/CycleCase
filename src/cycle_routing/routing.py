@@ -20,6 +20,8 @@ import inspect
 import json
 import math
 from pathlib import Path
+import re
+import time
 
 import geopandas as gpd
 import networkx as nx
@@ -28,7 +30,7 @@ import pandas as pd
 import shapely
 from shapely.geometry import LineString
 from shapely.ops import linemerge
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from .config import OSM_WAY_TAGS, TurnConfig
 from .graph import WEIGHT, build_graph, edge_costs
@@ -42,10 +44,11 @@ TURNS = {
 }
 
 EdgeKey = tuple[int, int, int]
-ROUTE_COLUMNS = ["od_id", "algorithm", "edge_route", "route_length_m", "turns", "geometry"]
+ROUTE_COLUMNS = ["od_id", "algorithm", "edge_route", "route_length_m", "turns", "search_ms", "geometry"]
 # Observation-table migrations do not alter routes: keys already hash roads, costs,
 # OD, turns and search. Keep their version independent of preparation.SCHEMA_VERSION.
-ROUTE_CACHE_VERSION = 1
+# Version 2 stores the search time measured when the route was found.
+ROUTE_CACHE_VERSION = 2
 
 
 def orient_coordinates(geometry, start_xy: tuple[float, float]) -> list[tuple[float, float]]:
@@ -135,13 +138,16 @@ def find_route(graph, origin: int, destination: int, *, search=nx.dijkstra_path,
     """Cheapest route between two nodes by the graph weight ``cost``; None when there is none.
 
     Returns ``edge_route`` (list of ``(u, v, key)``), ``route_length_m``, ``turns`` (left, right and
-    U-turns, counted the same way for every turn model) and ``geometry``.
+    U-turns, counted the same way for every turn model), ``search_ms`` (the search call only, without
+    building the graph) and ``geometry``.
     """
 
     search, turns = search_function(search), turn_model(turns)
     try:
         if turns is None:
+            started = time.perf_counter()
             nodes = search(graph, origin, destination, weight=WEIGHT)
+            elapsed = time.perf_counter() - started
             edge_route = [
                 (u, v, min(graph[u][v], key=lambda key: graph[u][v][key][WEIGHT])) for u, v in zip(nodes, nodes[1:])
             ]
@@ -150,7 +156,9 @@ def find_route(graph, origin: int, destination: int, *, search=nx.dijkstra_path,
             cache = graph.graph.setdefault("turn_graphs", {})
             if turns not in cache:
                 cache[turns] = turn_graph(graph, turns)
+            started = time.perf_counter()
             edge_route = search(cache[turns], ("start", origin), ("end", destination), weight=WEIGHT)[1:-1]
+            elapsed = time.perf_counter() - started
     except (nx.NetworkXNoPath, nx.NodeNotFound):
         return None
     if not edge_route:
@@ -165,6 +173,7 @@ def find_route(graph, origin: int, destination: int, *, search=nx.dijkstra_path,
         "edge_route": edge_route,
         "route_length_m": float(sum(graph.edges[edge]["length_m"] for edge in edge_route)),
         "turns": count_turns(graph, edge_route),
+        "search_ms": 1000 * elapsed,
         "geometry": geometry,
     }
 
@@ -204,7 +213,7 @@ def _fingerprint(model):
         return {"partial": _fingerprint(model.func), "args": repr(model.args), "kwargs": repr(sorted(model.keywords.items()))}
     try:
         code = inspect.getsource(model).encode()
-    except (OSError, TypeError):
+    except Exception:  # no readable source: built-ins, or a function unpickled from a notebook
         code = getattr(getattr(model, "__code__", None), "co_code", repr(model).encode())
     name = f"{getattr(model, '__module__', '')}.{getattr(model, '__qualname__', type(model).__name__)}"
     return {name: hashlib.sha256(code).hexdigest()[:12]}
@@ -231,7 +240,8 @@ def _preset_routes(edges, nodes, pairs, algorithm: str, preset: dict, cache_dir:
             "turns": _fingerprint(turns),
             "search": _fingerprint(search),
         }, sort_keys=True, default=str)
-        path = Path(cache_dir) / f"{algorithm}_{hashlib.sha256(key.encode()).hexdigest()[:12]}.pkl"
+        name = re.sub(r'[<>:"/\\|?*\s]+', "_", algorithm)  # any solution name must make a valid file name
+        path = Path(cache_dir) / f"{name}_{hashlib.sha256(key.encode()).hexdigest()[:12]}.pkl"
         if path.exists():
             return pd.read_pickle(path)
     graph = build_graph(edges, nodes, cost)
@@ -254,6 +264,7 @@ def build_routes(
     presets: dict[str, dict],
     *,
     cache_dir: Path | None = None,
+    progress: bool = True,
 ) -> gpd.GeoDataFrame:
     """Shortest route plus one route per preset for every start/finish pair.
 
@@ -269,6 +280,6 @@ def build_routes(
     runs = {"shortest": SHORTEST, **presets}
     frames = [
         _preset_routes(edges, nodes, pairs, algorithm, preset, cache_dir)
-        for algorithm, preset in tqdm(runs.items(), desc="Routes by preset")
+        for algorithm, preset in tqdm(runs.items(), desc="Routes by preset", disable=not progress or len(runs) == 1)
     ]
     return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), geometry="geometry", crs=edges.crs)

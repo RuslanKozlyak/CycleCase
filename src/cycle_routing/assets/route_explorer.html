@@ -5,65 +5,105 @@ html,body,#map{height:100%;margin:0;font:14px system-ui,sans-serif}#map{backgrou
 .controls{background:white;padding:12px 14px;width:300px;max-width:calc(100vw - 54px);box-shadow:0 2px 12px #0002;border-radius:6px}
 .controls h2{font-size:16px;margin:0 0 9px}.controls label{display:block;font-size:12px;color:#475569;margin-top:7px}
 .controls select{font:inherit;width:100%;padding:5px;border:1px solid #cbd5e1;border-radius:4px;background:white}
-.toggles label{display:inline-block;margin-right:10px}.summary{line-height:1.55;margin-top:10px;font-size:13px}
-.key{font-size:12px;margin-top:8px;color:#475569}.line{display:inline-block;width:20px;border-top:3px solid;margin-right:4px}
-.popup td{padding:2px 5px;border-bottom:1px solid #eee}.popup td:first-child{color:#64748b}.note{font-size:11px;color:#64748b;margin-top:7px}
+.toggles label{display:inline-block;margin-right:10px}
+.summary{margin-top:10px;font-size:13px;border-collapse:collapse;width:100%}.summary th{font-weight:normal;color:#64748b;text-align:right;font-size:11px}
+.summary td{padding:2px 0}.summary td+td{text-align:right;font-variant-numeric:tabular-nums}.summary .note{color:#b45309;font-size:12px;text-align:left}
+.legend{background:white;padding:8px 12px;box-shadow:0 2px 12px #0002;border-radius:6px;font-size:12px;color:#334155;max-width:calc(100vw - 80px)}
+.legend .bar{width:220px;max-width:100%;height:10px;border-radius:3px;background:linear-gradient(90deg,hsl(220 75% 47%),hsl(165 75% 47%),hsl(110 75% 47%),hsl(55 75% 47%),hsl(0 75% 47%));margin:4px 0 2px}
+.legend .ticks{display:flex;justify-content:space-between;width:220px;max-width:100%;color:#64748b}
+.legend .item{margin-top:5px}.line{display:inline-block;width:22px;border-top:3px solid;margin-right:5px;vertical-align:middle}
+.popup td{padding:2px 5px;border-bottom:1px solid #eee}.popup td:first-child{color:#64748b}
 </style>
 <div id="map"></div><script>__LEAFLET_JS__</script>
 <script>
 const DATA=__DATA__;
 const map=L.map('map',{preferCanvas:true,zoomControl:false});
 L.control.zoom({position:'bottomright'}).addTo(map);
-const context=L.polyline(DATA.context,{color:'#bdc6d1',weight:1,opacity:.6,interactive:false}).addTo(map);
-const selected=L.layerGroup().addTo(map), baseline=L.layerGroup().addTo(map), endpoints=L.layerGroup().addTo(map);
+const UNKNOWN='#cbd5e1';
+// Every road has the same codes on the route and around it: [popularity or -1, bike, road, surface, lit, speed].
+const MODES={
+ pop:{label:'Популярность улиц',color:a=>a[0]<0?null:ramp(a[0]/100),bar:['0','50','100'],title:'популярность улицы',unknown:'нет измерения'},
+ bike:{label:'Велоинфраструктура',color:a=>a[1]?'#16a34a':'#475569',items:[['#16a34a','велодорожка или велополоса'],['#475569','нет']]},
+ road:{label:'Тип дороги',color:a=>['#16a34a','#dc2626','#2563eb','#a855f7','#a16207','#64748b'][a[2]],
+  items:[['#16a34a','велодорожка'],['#dc2626','крупная дорога'],['#2563eb','жилая улица'],['#a855f7','пешеходная, тропа'],['#a16207','служебная, полевая'],['#64748b','прочие']]},
+ surface:{label:'Покрытие',color:a=>['#2563eb','#f59e0b','#92400e',null][a[3]],items:[['#2563eb','асфальт, бетон'],['#f59e0b','плитка, брусчатка'],['#92400e','грунт, гравий']],unknown:'нет данных'},
+ lit:{label:'Освещение',color:a=>['#1e293b','#eab308',null][a[4]],items:[['#eab308','есть'],['#1e293b','нет']],unknown:'нет данных'},
+ speed:{label:'Скорость машин',color:a=>['#16a34a','#f59e0b','#dc2626',null][a[5]],items:[['#16a34a','до 30 км/ч'],['#f59e0b','40–50 км/ч'],['#dc2626','60+ км/ч']],unknown:'нет данных'},
+ cost:{label:'Стоимость 1 метра',bar:['дешевле','','дороже'],title:'стоимость 1 метра'},
+ route:{label:'Отличия от кратчайшего',items:[['#7c3aed','общий с кратчайшим'],['#ea580c','новый участок']]},
+};
+const contextGrey=L.polyline(DATA.context.lines,{color:'#bdc6d1',weight:1,opacity:.6,interactive:false}).addTo(map);
+const contextColored={};let contextShown=contextGrey;
+const tracks=L.polyline(DATA.tracks,{color:'#e11d48',weight:2,opacity:.45,interactive:false});if(DATA.tracks.length)tracks.addTo(map);
+const baseline=L.layerGroup().addTo(map), selected=L.layerGroup().addTo(map), endpoints=L.layerGroup().addTo(map);
 const tiles=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap contributors'});
-const control=L.control({position:'topleft'});
-let odSelect,modelSelect,modeSelect,summary,key;
+const control=L.control({position:'topleft'}),legend=L.control({position:'bottomleft'});
+let odSelect,modelSelect,modeSelect,summary,legendBox,showNetwork,colorNetwork;
 function el(tag,text,parent){let n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(parent)parent.appendChild(n);return n;}
 function selector(parent,label,options){let l=el('label',label,parent),s=el('select',undefined,l);for(let [value,text] of options){let o=el('option',text,s);o.value=value;}return s;}
+function checkbox(parent,text,checked,onchange){let l=el('label',undefined,parent),c=el('input',undefined,l);c.type='checkbox';c.checked=checked;l.appendChild(document.createTextNode(text));c.onchange=onchange;return c;}
 control.onAdd=function(){const root=L.DomUtil.create('div','controls');
  el('h2','Сравнение маршрутов',root);
  odSelect=selector(root,'Пара A–B',DATA.ods.map(s=>[s,s]));odSelect.value=DATA.first;
  modelSelect=selector(root,'Решение',DATA.models.map(s=>[s,DATA.labels[s]]));modelSelect.value=DATA.models.find(s=>s!=='shortest')||'shortest';
- modeSelect=selector(root,'Цвет выбранного пути',[['route','Отличия от кратчайшего'],['road','Тип дороги'],['cost','Стоимость 1 метра'],['pop','Доступные измерения поездок']]);
+ modeSelect=selector(root,'Цвет',Object.entries(MODES).map(([k,m])=>[k,m.label]));
  const toggles=el('div',undefined,root);toggles.className='toggles';
- for(let [text,layer,checked] of [['Сеть',context,true],['Подложка OSM',tiles,false]]){let l=el('label',undefined,toggles),c=el('input',undefined,l);c.type='checkbox';c.checked=checked;l.appendChild(document.createTextNode(text));c.onchange=()=>c.checked?layer.addTo(map):map.removeLayer(layer);}
- summary=el('div',undefined,root);summary.className='summary';
- key=el('div',undefined,root);key.className='key';
- const note=el('div','Сеть и маршруты работают без интернета. OSM-подложка требует интернет. Серый пунктир в режиме поездок — нет измерения.',root);note.className='note';
+ showNetwork=checkbox(toggles,'Сеть',true,()=>drawContext());
+ colorNetwork=checkbox(toggles,'Цвет дорог вокруг',false,()=>drawContext());
+ checkbox(toggles,'Подложка OSM',false,e=>e.target.checked?tiles.addTo(map):map.removeLayer(tiles));
+ if(DATA.tracks.length)checkbox(toggles,'GPX-треки',true,e=>e.target.checked?tracks.addTo(map):map.removeLayer(tracks));
+ summary=el('table',undefined,root);summary.className='summary';
  L.DomEvent.disableClickPropagation(root);L.DomEvent.disableScrollPropagation(root);
- odSelect.onchange=()=>render(true);modelSelect.onchange=()=>render(false);modeSelect.onchange=()=>render(false);return root;
+ odSelect.onchange=()=>render(true);modelSelect.onchange=()=>render(false);modeSelect.onchange=()=>{drawContext();render(false);};return root;
 };control.addTo(map);
+legend.onAdd=function(){legendBox=L.DomUtil.create('div','legend');return legendBox;};legend.addTo(map);
 function format(n,d=1){return n===null||n===undefined?'нет данных':Number(n).toFixed(d);}
 function ramp(value){value=Math.max(0,Math.min(1,value));return `hsl(${220-220*value} 75% 47%)`;}
-function popup(s,cost){const t=el('table');t.className='popup';for(let [name,value] of [['highway',s.highway],['покрытие',s.surface],['длина, м',format(s.length)],['стоимость 1 м',format(cost,2)],['поездок (доступные метки)',format(s.trips)],['велоинфраструктура',s.bike?'да':'нет']]){let r=el('tr',undefined,t);el('td',name,r);el('td',value,r);}return t;}
+const item=(color,text,dashed,width=3)=>`<div class="item"><span class="line" style="color:${color};border-top-style:${dashed?'dashed':'solid'};border-top-width:${width}px"></span>${text}</div>`;
+function colored(mode){ // the network around, one polyline per colour
+ if(contextColored[mode])return contextColored[mode];
+ const groups={},paint=MODES[mode].color;
+ DATA.context.attrs.forEach((a,i)=>{let c=mode==='bike'&&!a[1]?null:paint(a);if(mode==='pop'&&c)c=ramp(Math.round(a[0]/10)/10);(groups[c||UNKNOWN]??=[]).push(DATA.context.lines[i]);});
+ const layer=L.layerGroup();
+ for(const [c,lines] of Object.entries(groups))L.polyline(lines,{color:c,weight:c===UNKNOWN?1:1.3,opacity:c===UNKNOWN?.5:.65,interactive:false}).addTo(layer);
+ return contextColored[mode]=layer;
+}
+function drawContext(){map.removeLayer(contextShown);const mode=modeSelect.value;
+ contextShown=colorNetwork.checked&&MODES[mode].color?colored(mode):contextGrey;
+ if(showNetwork.checked)contextShown.addTo(map);
+ [tracks,baseline,selected,endpoints].forEach(l=>{if(map.hasLayer(l)){map.removeLayer(l);l.addTo(map);}});
+}
+function popup(s,cost){const t=el('table');t.className='popup';for(let [name,value] of [['тип дороги',s.highway],['покрытие',s.surface],['длина, м',format(s.length)],['стоимость 1 м',format(cost,2)],['популярность, 0–100',format(s.pop,0)],['поездок',format(s.trips,0)],['велоинфраструктура',s.a[1]?'да':'нет']]){let r=el('tr',undefined,t);el('td',name,r);el('td',value,r);}return t;}
+function row(name,value){const r=el('tr',undefined,summary);el('td',name,r);el('td',value,r);}
 function render(fit){selected.clearLayers();baseline.clearLayers();endpoints.clearLayers();summary.replaceChildren();
- const od=odSelect.value,model=modelSelect.value,mode=modeSelect.value,routes=DATA.routes[od],base=routes.shortest,path=routes[model];
- key.innerHTML={
-  route:'<span class="line" style="color:#64748b"></span>кратчайший<br><span class="line" style="color:#7c3aed"></span>общий участок &nbsp; <span class="line" style="color:#ea580c"></span>новый',
-  road:'<span class="line" style="color:#16a34a"></span>вело &nbsp; <span class="line" style="color:#dc2626"></span>крупная дорога<br><span class="line" style="color:#2563eb"></span>остальные',
-  cost:'Цена метра: синий — ниже, красный — выше. Точное значение — по щелчку.',
-  pop:'Поездки: синий — меньше, красный — больше.<br>Серый пунктир — нет измерения.'
- }[mode];
+ const od=odSelect.value,model=modelSelect.value,mode=modeSelect.value,m0=MODES[mode],routes=DATA.routes[od],base=routes.shortest,path=routes[model];
+ legendBox.innerHTML=(m0.bar?`${m0.title}<div class="bar"></div><div class="ticks">${m0.bar.map(t=>`<span>${t}</span>`).join('')}</div>`:'')
+  +(m0.items||[]).map(([c,t])=>item(c,t)).join('')+(m0.unknown?item('#9ca3af',m0.unknown,true):'')
+  +item('#64748b','кратчайший путь',true,6)+(DATA.tracks.length?item('#e11d48','GPX-треки'):'');
  for(let k of base.edges)L.polyline(DATA.segments[k].line,{color:'#64748b',weight:7,opacity:.65,dashArray:'7,5',interactive:false}).addTo(baseline);
- if(!path){el('div','Маршрут не построен',summary);return;}
+ if(!path){row('Маршрут не построен','');return;}
  const baseSet=new Set(base.edges),bounds=[];
- for(let k of path.edges){let s=DATA.segments[k],color,missing=false;
-  if(mode==='road')color=s.bike?'#16a34a':s.major?'#dc2626':'#2563eb';
-  else if(mode==='cost')color=ramp(Math.log1p(DATA.costs[model][k])/Math.log1p(5));
-  else if(mode==='pop'){missing=s.trips===null;color=missing?'#9ca3af':ramp(Math.log1p(s.trips)/Math.log1p(DATA.maxTrips||1));}
-  else color=baseSet.has(k)?'#7c3aed':'#ea580c';
-  const line=L.polyline(s.line,{color,weight:4,opacity:.95,dashArray:missing?'4,4':null}).addTo(selected);
+ for(let k of path.edges)L.polyline(DATA.segments[k].line,{color:'#0f172a',weight:8,opacity:.45,interactive:false}).addTo(selected); // outline first
+ for(let k of path.edges){let s=DATA.segments[k],color;
+  if(mode==='cost')color=ramp(Math.log1p(DATA.costs[model][k])/Math.log1p(5));
+  else if(mode==='route')color=baseSet.has(k)?'#7c3aed':'#ea580c';
+  else color=m0.color(s.a);
+  const missing=!color;
+  const line=L.polyline(s.line,{color:missing?'#9ca3af':color,weight:4,opacity:.95,dashArray:missing?'4,4':null}).addTo(selected);
   line.bindPopup(()=>popup(s,DATA.costs[model][k]));line.on('mouseover',()=>line.setStyle({weight:7}));line.on('mouseout',()=>line.setStyle({weight:4}));bounds.push(...s.line);
  }
  const first=DATA.segments[path.edges[0]].line[0],lastLine=DATA.segments[path.edges[path.edges.length-1]].line,last=lastLine[lastLine.length-1];
  L.circleMarker(first,{radius:6,color:'#15803d',fillOpacity:1}).bindTooltip('A: старт').addTo(endpoints);
  L.circleMarker(last,{radius:6,color:'#dc2626',fillOpacity:1}).bindTooltip('B: финиш').addTo(endpoints);
- el('div',`${format(path.length/1000,2)} км · объезд ${format(100*(path.length/base.length-1))}% · поворотов ${path.turns}`,summary);
- const m=DATA.detail[od]?.[model];
- if(m){el('div',`${DATA.split}: покрытие ${format(m.coverage)}% · популярность ${m.gain===null?'нет данных':'×'+format(Math.exp(m.gain),2)}`,summary);
-  el('div',m.included?`${format(m.points,1)} балла за OD · ${m.reason}`:'Эта OD не входит в оценку: недостаточно измерений у базы',summary);}
- if(fit&&bounds.length)map.fitBounds(bounds,{paddingTopLeft:map.getSize().x>750?[370,30]:[20,380],paddingBottomRight:[30,30]});
+ const m=DATA.detail[od]?.[model],b=DATA.detail[od]?.shortest;
+ const head=el('tr',undefined,summary);el('th','',head);el('th',`${DATA.labels[model]} / кратчайший`,head);
+ row('длина, км',`${format(path.length/1000,2)} / ${format(base.length/1000,2)}`);
+ row('популярность',`${format(m?.popularity)} / ${format(b?.popularity)}`);
+ if(m?.gpx!==undefined&&m?.gpx!==null)row('совпадение с GPX, %',`${format(m.gpx,0)} / ${format(b?.gpx,0)}`);
+ row('поворотов',`${path.turns} / ${base.turns}`);
+ row('объезд',`${format(100*(path.length/base.length-1))}%`);
+ if(m?.note){const r=el('tr',undefined,summary),c=el('td',m.note,r);c.colSpan=2;c.className='note';}
+ if(fit&&bounds.length)map.fitBounds(bounds,{paddingTopLeft:map.getSize().x>750?[370,30]:[20,380],paddingBottomRight:[30,90]});
 }
 render(true);setTimeout(()=>map.invalidateSize(),100);
 </script></html>

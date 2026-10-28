@@ -1,98 +1,197 @@
+from dataclasses import replace
+
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
+from shapely.geometry import LineString
 
-from cycle_routing import prepare_city, is_rideable
+from cycle_routing import prepare_city
 from cycle_routing.evaluation import edge_trips
+from cycle_routing.tags import has_any
 from cycle_routing.workshop import (
-    EvaluationRules, compare, evaluate_routes, export_solution, features, load_lab,
-    preset, priority_cost, route_diagnostics, run_routes,
+    build_network, closed_city, comfort_cost, data_dictionary, example_rows, export_solution, features, grade,
+    gpx_table, load_city, ml_feature, preview_cost, preview_features, rideable, score, solution, train_model,
 )
 from cycle_routing.workshop_data import write_lab_pack
 from cycle_routing.workshop_maps import route_explorer
 
 
 @pytest.fixture
-def lab(toy_city,tmp_path):
-    edges,nodes=prepare_city("toytown",cache_dir=toy_city["cache_dir"])
-    edges=edges[is_rideable(edges)]
-    pairs=pd.DataFrame({"od_id":["A"],"origin":[1],"destination":[4],
-                        "start_lat":[47.66],"start_lon":[9.17],"end_lat":[47.661],"end_lon":[9.171]})
-    trips=edge_trips(edges,"toytown",cache_dir=toy_city["cache_dir"])
-    # The north road is held out; south is public for validation, with explicit low counts.
-    partition=pd.Series("train",index=edges.index)
-    partition.loc[edges.highway.str.contains("primary")]= "validation"
-    partition.loc[edges.highway.str.contains("cycleway")]= "test"
-    public=tmp_path/"public"; private=tmp_path/"private"
-    write_lab_pack(edges,nodes,pairs,trips,partition,folder=public,private_folder=private,city="toy")
-    return load_lab(public),private
+def lab(toy_city, tmp_path):
+    """North cycleway (popular) and south primary (quiet) are open; the footway is the closed zone."""
+    roads, nodes = prepare_city("toytown", cache_dir=toy_city["cache_dir"])
+    trips = edge_trips(roads, "toytown", cache_dir=toy_city["cache_dir"])
+    footway = has_any(roads.highway, "footway")
+    trips[footway] = 7.0
+    zone = pd.Series(np.where(footway | has_any(roads.highway, "steps"), "closed", "open"), index=roads.index)
+    pairs = pd.DataFrame({"od_id": ["OD01", "CL01"], "origin": [1, 1], "destination": [4, 4], "zone": ["open", "closed"],
+                          "start_lat": [47.66] * 2, "start_lon": [9.17] * 2, "end_lat": [47.661] * 2, "end_lon": [9.171] * 2})
+    public, private = tmp_path / "public", tmp_path / "private"
+    write_lab_pack(roads, nodes, pairs, trips, zone, folder=public, private_folder=private, city="toy",
+                   split_params={"method": "test"})
+    return load_city(public), private
 
 
-def test_features_have_no_targets_and_numeric_defaults_are_explicit(lab):
-    data,_=lab
-    f=features(data.edges.assign(trips=1e9,has_observation=True,popularity=42))
-    assert not {"trips","has_observation","popularity","u","v","key","geometry"}&set(f)
-    assert f.width_m_missing.equals(data.edges.width.isna())
-    assert f.loc[f.width_m_missing, "width_m"].eq(3).all()
-    assert f.loc[~f.width_m_missing, "width_m"].equals(data.edges.loc[data.edges.width.notna(), "width"].rename("width_m"))
-    cost=priority_cost(traffic=2,cycling=1)(data.edges)
-    assert cost.index.equals(data.edges.index) and np.isfinite(cost).all() and cost.gt(0).all()
+def bike():
+    return solution(comfort_cost({"велодорожка": -0.9, "крупная_дорога": 2}), turns=None, label="bike")
 
 
-def test_public_pack_does_not_expose_test_labels_and_load_never_downloads(lab):
-    data,private=lab
-    assert not (data.folder/"labels_test.parquet").exists()
-    assert (private/"test_labels.parquet").exists()
-    with pytest.raises(ValueError,match="организатор"):
-        data.labels_for("test")
-    with pytest.raises(FileNotFoundError,match="подготовленного"):
-        load_lab(data.folder/"missing")
+def test_student_table_is_russian_and_features_have_no_targets(lab):
+    data, _ = lab
+    assert {"тип_дороги", "покрытие", "длина_м", "геометрия"} <= set(data.roads) and "highway" not in data.roads
+    assert data.roads.index.equals(data.osm.index)
+    f = features(data.roads.assign(trips=1e9, popularity=42))
+    assert not {"trips", "popularity"} & set(f) and {"велодорожка", "крупная_дорога", "скорость"} <= set(f)
+    assert f.loc[f["ширина_неизвестна"].eq(1), "ширина"].eq(3).all()
 
 
-def test_baseline_has_50_points_and_over_budget_does_not_disappear(lab):
-    data,private=lab
-    solutions={"bike":preset("bike",cost=priority_cost(traffic=10,cycling=2),turns=None)}
-    routes=run_routes(data,solutions)
-    labels=pd.read_parquet(private/"test_labels.parquet")
-    # Test labels only cover the north path; evaluate instead all explicitly known streets here.
-    public=data.labels_for("validation")
-    private_y=labels.set_index(["u","v","key"]).trips.reindex(pd.MultiIndex.from_frame(data.edges[["u","v","key"]]))
-    y=public.combine_first(pd.Series(private_y.to_numpy(),index=data.edges.index))
-    full=data.edges[["u","v","key"]].assign(trips=y).dropna(subset="trips")
-    result=evaluate_routes(data,routes,labels=full,rules=EvaluationRules(max_detour_pct=0),solutions=solutions)
-    assert result.table.loc["shortest","балл / 100"]==50
-    assert result.table.loc["bike","балл / 100"]==0
-    assert result.table.loc["bike","OD для оценки"]==1
-    missing=evaluate_routes(data,routes[routes.algorithm.eq("shortest")],labels=full,solutions=solutions)
-    assert missing.table.loc["bike","балл / 100"]==0
-    assert missing.table.loc["bike","OD для оценки"]==1
+def test_public_pack_hides_closed_zone_but_marks_it(lab):
+    data, private = lab
+    assert {p.name for p in data.folder.iterdir()} >= {"roads.parquet", "labels.parquet", "pairs.parquet", "test_area.parquet"}
+    assert not any("closed" in p.name or "zones" in p.name for p in data.folder.iterdir())
+    assert list(data.pairs.od_id) == ["OD01"]
+    footway = has_any(data.osm.highway, "footway")
+    assert data.trips[footway].isna().all() and data.test_area[footway].all() and not data.test_area[~footway & ~has_any(data.osm.highway, "steps")].any()
+    assert data.trips.notna().sum() == 8  # north and south street, two ways each, both directions
+    closed = closed_city(data, private)
+    assert list(closed.pairs.od_id) == ["CL01"] and closed.trips.dropna().eq(7).all()
+    with pytest.raises(FileNotFoundError, match="подготовленного"):
+        load_city(data.folder / "missing")
+    (data.folder / "labels.parquet").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="Изменён"):
+        load_city(data.folder)
 
 
-def test_invalid_paths_and_forged_lengths_are_not_accepted(lab):
-    data,_=lab
-    routes=run_routes(data,{"mine":preset("mine",cost="length_m",turns=None)})
-    forged=routes.copy(); forged["route_length_m"]=1
-    result=evaluate_routes(data,forged,solutions={"mine":{}})
-    assert result.table.loc["mine","объезд, %"]==0
-    forged=routes.copy(); index=forged.index[forged.algorithm.eq("mine")][0]
-    forged.at[index,"edge_route"]=[(1,4,999)]
-    with pytest.raises(ValueError,match="Некорректный"):
-        evaluate_routes(data,forged)
+def test_score_compares_with_shortest_and_applies_detour_rule(lab):
+    data, _ = lab
+    result = score(data, {"bike": bike()})
+    table, per_od = result.table, result.per_od.set_index("algorithm")
+    assert table.loc["bike", "популярность"] > table.loc["кратчайший", "популярность"]
+    assert table.loc["bike", "популярнее кратчайшего"] == "1 из 1"
+    assert table.loc["кратчайший", "объезд, %"] == 0
+    assert per_od.loc["bike", "search_ms"] >= 0
+    strict = score(data, {"bike": bike()}, max_detour_pct=1).per_od.set_index("algorithm")
+    assert strict.loc["bike", "counted"] == strict.loc["shortest", "counted"]
+    assert "в оценку идёт кратчайший" in strict.loc["bike", "note"]
 
 
-def test_submission_roundtrip_and_offline_map(lab,tmp_path):
-    data,_=lab
-    result=compare(data,{"mine":preset("mine",cost="length_m",turns=None)})
-    diagnostics=route_diagnostics(data,result)
-    assert diagnostics.loc["mine","OD изменено"]==0
-    folder=export_solution(data,result,algorithm="mine",folder=tmp_path/"submission")
-    restored=gpd.read_parquet(folder/"routes.parquet")
-    assert len(restored)==1
-    evaluate_routes(data,restored,solutions={"mine":{}})
-    path=tmp_path/"map.html"
-    view=route_explorer(data,result,filename=path)
-    text=path.read_text(encoding="utf-8")
-    assert "__DATA__" not in text and "__LEAFLET_JS__" not in text
-    assert "L.map('map'" in text and 'src="http' not in text
-    assert "нет данных" in text and 'title="Сравнение' in view._repr_html_()
+def test_unmeasured_roads_count_as_average(lab):
+    data, _ = lab
+    north = has_any(data.osm.highway, "cycleway")
+    unmeasured = replace(data, trips=data.trips.where(~north))
+    per_od = score(unmeasured, {"bike": bike()}).per_od.set_index("algorithm")
+    assert per_od.loc["bike", "coverage_pct"] == 0 and per_od.loc["bike", "counted"] == 50
+
+
+def test_own_cost_function_gets_russian_table(lab):
+    data, _ = lab
+    seen = []
+
+    def my_cost(roads):
+        seen.append(set(roads.columns))
+        return roads["длина_м"] * (1 + 5 * roads["тип_дороги"].eq("primary"))
+
+    per_od = score(data, {"own": solution(my_cost, turns=None)}).per_od.set_index("algorithm")
+    assert "тип_дороги" in seen[0] and "highway" not in seen[0]
+    assert per_od.loc["own", "popularity"] > per_od.loc["shortest", "popularity"]
+    preview = preview_cost(data, my_cost, n=2)
+    assert list(preview.columns)[-1] == "стоимость" and len(preview) == 2
+
+
+def test_preview_shows_weighted_features_and_cost_last(lab):
+    data, _ = lab
+    preview = preview_cost(data, comfort_cost({"велодорожка": -0.5}), n=3)
+    assert list(preview.columns) == ["тип_дороги", "велодорожка", "длина_м", "цена 1 м", "стоимость"]
+    assert (preview["цена 1 м"].where(preview["велодорожка"].eq(1)).dropna() == 0.5).all()
+    with pytest.raises(KeyError, match="велодорожка"):
+        preview_cost(data, comfort_cost({"no_such_feature": 1}))
+
+
+def test_filter_without_route_counts_zero(lab):
+    data, _ = lab
+    network = build_network(data, lambda roads: rideable(roads) & roads["тип_дороги"].eq("cycleway"))
+    assert "Без маршрута останутся пары: 1" in network.summary()
+    per_od = score(data, {"bike": bike()}, network=network).per_od.set_index("algorithm")
+    assert per_od.loc["bike", "counted"] == 0 and per_od.loc["bike", "note"] == "нет маршрута"
+    with pytest.raises(ValueError, match="True/False"):
+        build_network(data, lambda roads: roads["длина_м"])
+
+
+def test_data_dictionary_lists_every_value_and_examples_cover_every_column(lab):
+    data, _ = lab
+    dictionary = data_dictionary(data).data
+    assert len(dictionary) == len(data.roads.columns) + 1 and list(dictionary.columns) == ["тип", "значения"]
+    assert "поездки (city.trips)" in dictionary.index
+    kinds = data.roads["тип_дороги"].dropna().str.split(";").explode().unique()
+    assert all(kind in dictionary.loc["тип_дороги", "значения"] for kind in kinds) and "…" not in dictionary.loc["тип_дороги", "значения"]
+    rows = example_rows(data)
+    filled_anywhere = data.roads.drop(columns="геометрия").notna().any()
+    assert rows.notna().any()[filled_anywhere].all() and len(rows) < len(data.roads)
+
+
+def test_previews_show_own_features_where_they_are_present(lab):
+    data, _ = lab
+
+    def my_features(roads):
+        return pd.DataFrame({"лестница": roads["тип_дороги"].eq("steps").astype(float)}, index=roads.index)
+
+    shown = preview_features(data, my_features)
+    assert list(shown.columns) == ["тип_дороги", "лестница"] and shown["лестница"].eq(1).any()
+    formula = lambda roads: roads["длина_м"] * (1 + my_features(roads)["лестница"])
+    preview = preview_cost(data, formula, extra=my_features)
+    assert list(preview.columns) == ["тип_дороги", "лестница", "длина_м", "цена 1 м", "стоимость"]
+    assert (preview["цена 1 м"].where(preview["лестница"].eq(1)).dropna() == 2).all()
+
+
+def test_export_and_grade_on_closed_zone(lab, tmp_path):
+    data, private = lab
+    keep = lambda roads: rideable(roads) | has_any(roads["тип_дороги"], "footway")
+    folder = export_solution(data, bike(), keep=keep, folder=tmp_path / "submission")
+    result = grade(data, private, folder)
+    assert set(result.table.index) == {"решение", "кратчайший"}
+    assert result.lab.name == "закрытая зона"
+
+
+def test_route_explorer_is_offline_and_shows_tracks(lab, tmp_path):
+    data, _ = lab
+    result = score(data, {"bike": bike()})
+    tracks = gpd.GeoDataFrame({"activity_id": ["ride"]}, geometry=[LineString(data.osm.geometry.iloc[0].coords)], crs=data.osm.crs)
+    path = tmp_path / "map.html"
+    view = route_explorer(data, result, filename=path, tracks=tracks)
+    text = path.read_text(encoding="utf-8")
+    assert "__DATA__" not in text and "__LEAFLET_JS__" not in text and 'src="http' not in text
+    assert "GPX-треки" in text and '"tracks":[[' in text and "популярность улицы" in text and '"gpx":' in text
+    assert 'title="Сравнение' in view._repr_html_()
+
+
+def test_gpx_table_measures_overlap_with_rides(lab):
+    data, _ = lab
+    result = score(data, {"bike": bike()})
+    north = data.osm[has_any(data.osm.highway, "cycleway")]
+    tracks = gpd.GeoDataFrame({"activity_id": ["north"] * len(north)}, geometry=list(north.geometry), crs=data.osm.crs)
+    table = gpx_table(result, tracks)
+    assert table.loc["bike"].iloc[0] == 100 and table.loc["кратчайший"].iloc[0] < 50
+
+
+def test_any_solution_name_works_with_the_route_cache(lab):
+    data, _ = lab
+    table = score(data, {'веса: "моё" / v2?': bike()}).table
+    assert 'веса: "моё" / v2?' in table.index
+    assert all(":" not in p.name and "?" not in p.name for p in (data.folder / "route_cache").iterdir())
+
+
+def test_own_sklearn_model_learns_from_ready_and_own_features(lab):
+    from sklearn.tree import DecisionTreeRegressor
+    data, _ = lab
+
+    def my_features(roads):
+        return pd.DataFrame({"велоулица": roads["тип_дороги"].str.contains("cycleway", na=False).astype(float)}, index=roads.index)
+
+    trained = train_model(data, DecisionTreeRegressor(max_depth=1), extra=my_features)
+    assert "велоулица" in trained.columns and "велодорожка" in trained.columns and "длина_м" not in trained.columns
+    predicted = trained.predict_log_trips(data.osm)
+    assert predicted.index.equals(data.osm.index) and predicted.notna().all()
+    cost = comfort_cost({"ml_популярность": -0.8}, extra=ml_feature(trained))
+    per_od = score(data, {"ml": solution(cost, turns=None)}).per_od.set_index("algorithm")
+    assert per_od.loc["ml", "popularity"] > per_od.loc["shortest", "popularity"]  # the popular north road is learned
