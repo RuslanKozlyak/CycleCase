@@ -21,10 +21,10 @@ def main():
     parser.add_argument("submissions", type=Path)
     parser.add_argument("--pack", default="konstanz_more")
     args = parser.parse_args()
-    lab = load_city(ROOT/"notebooks/data/hackathon"/args.pack)
-    teams = load_submissions(args.submissions, lab)
+    city = load_city(ROOT/"notebooks/data/hackathon"/args.pack)
+    teams = load_submissions(args.submissions, city)
     print(submissions_table(teams).to_string())
-    board = grade_all(lab, ROOT/"outputs/hackathon_private"/args.pack, teams)
+    board = grade_all(city, ROOT/"outputs/hackathon_private"/args.pack, teams)
     board.table.to_csv(args.submissions/"leaderboard.csv")
     print("\n" + board.table.to_string())
     if len(board.errors):

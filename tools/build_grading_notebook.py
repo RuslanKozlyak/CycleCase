@@ -71,7 +71,7 @@ code("""
 code('board.errors if len(board.errors) else "Все решения оценены."')
 
 md("## 3. Маршруты на закрытой зоне")
-code('route_explorer(board.result.lab, board.result, filename=OUTPUT / "closed_routes.html")')
+code('route_explorer(board.result.city, board.result, filename=OUTPUT / "closed_routes.html")')
 
 md("## 4. Баллы по парам")
 code("""

@@ -75,10 +75,10 @@ def _candidate_pairs(graph, points, rng, per_band):
 
 def _corridor(graph, edge_of, length, measured, city, a, b, max_detour, n_alt=2, penalty=3.0):
     """Shortest path plus penalty-method alternatives that stay within the detour limit."""
-    sp_len, sp = nx.bidirectional_dijkstra(graph, a, b, weight="w")
+    sp_len, sp = nx.single_source_dijkstra(graph, a, b, weight="w")
     paths, used = [sp], {(x, y) for x, y in zip(sp, sp[1:])}
     for _ in range(n_alt):
-        _, alt = nx.bidirectional_dijkstra(graph, a, b, weight=lambda u, v, d: d["w"] * (penalty if (u, v) in used else 1))
+        _, alt = nx.single_source_dijkstra(graph, a, b, weight=lambda u, v, d: d["w"] * (penalty if (u, v) in used else 1))
         if alt in paths or sum(graph[x][y]["w"] for x, y in zip(alt, alt[1:])) > (1 + max_detour) * sp_len:
             break
         paths.append(alt)
@@ -104,9 +104,10 @@ def probe_solutions():
     """Ready presets plus contrasting single-feature weights: a spread of reasonable configurations."""
     from .presets import COMFORT_PRESETS
     from .workshop import comfort_cost
+    from .workshop_compat import legacy_features
     weights = {"bike": {"велодорожка": -0.7}, "major": {"крупная_дорога": 1.5}, "rough": {"плохое_покрытие": 1.0},
                "quiet": {"жилая_улица": -0.4, "крупная_дорога": 0.8}, "paths": {"пешеходная": -0.5}}
-    return {**COMFORT_PRESETS, **{f"probe_{name}": {"cost": comfort_cost(w), "turns": None, "search": "dijkstra"}
+    return {**COMFORT_PRESETS, **{f"probe_{name}": {"cost": comfort_cost(w, features=legacy_features), "turns": None, "search": "dijkstra"}
                                   for name, w in weights.items()}}
 
 

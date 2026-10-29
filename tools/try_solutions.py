@@ -3,7 +3,7 @@
     python tools/try_solutions.py --pack konstanz
 
 Every idea is written the way a team would write it in the notebook: weights, own features, own cost,
-turns, search, ML. A deliberately forbidden "cheat" (cost from lab.trips) shows why the closed zone exists.
+turns, search, ML. A deliberately forbidden "cheat" (cost from city.trips) shows why the closed zone exists.
 Writes outputs/solution_ideas/<pack>/ideas.csv and ideas.md.
 """
 from pathlib import Path
@@ -18,21 +18,22 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/"src"))
 from cycle_routing.workshop import (
-    build_network, closed_city, comfort_cost, features, load_city, ml_feature, presets, rideable, score, solution,
+    build_network, closed_city, comfort_cost, load_city, ml_feature, presets, rideable, score, solution,
     train_popularity,
 )
+from cycle_routing.workshop_compat import legacy_features as features
 
 BASE = {"крупная_дорога": 0.6, "плохое_покрытие": 0.4, "велодорожка": -0.4, "без_освещения": 0.2}
 
 
-# --- own features: what a team could add in my_features(roads) -----------------------------------------
+# --- example feature recipes for the organizer's broader experiment ---------------------------------
 
 def asphalt(roads):
-    return pd.DataFrame({"асфальт": roads["покрытие"].eq("asphalt").astype(float)}, index=roads.index)
+    return pd.DataFrame({"асфальт": roads["покрытие"].eq("асфальт").astype(float)}, index=roads.index)
 
 
 def bikes_welcome(roads):
-    return pd.DataFrame({"велосипед_разрешён": roads["велосипед"].isin(["yes", "designated"]).astype(float)}, index=roads.index)
+    return pd.DataFrame({"велосипед_разрешён": roads["велосипед"].isin(["разрешён", "предназначено_для_велосипедов"]).astype(float)}, index=roads.index)
 
 
 def calm(roads):
@@ -40,8 +41,8 @@ def calm(roads):
 
 
 def main_with_lane(roads):
-    lane = roads["велополоса"].notna() & ~roads["велополоса"].isin(["no", "separate"])
-    main = roads["тип_дороги"].isin(["primary", "secondary", "tertiary"])
+    lane = roads["велополоса"].notna() & ~roads["велополоса"].isin(["нет", "велодорожка_отдельной_линией_osm"])
+    main = roads["тип_дороги"].isin(["главная_дорога", "дорога_второго_значения", "местная_дорога"])
     return pd.DataFrame({"магистраль_с_полосой": (main & lane).astype(float)}, index=roads.index)
 
 
@@ -51,8 +52,9 @@ def long_segment(roads):
 
 # --- own cost: a whole formula --------------------------------------------------------------------------
 
-TYPE_PRICE = {"cycleway": 0.5, "living_street": 0.7, "residential": 0.8, "path": 0.9, "tertiary": 1.0, "unclassified": 1.0,
-              "service": 1.1, "track": 1.2, "secondary": 1.3, "footway": 1.4, "pedestrian": 1.3, "primary": 1.6}
+TYPE_PRICE = {"велодорожка": 0.5, "жилая_зона": 0.7, "жилая_улица": 0.8, "тропа": 0.9, "местная_дорога": 1.0,
+              "прочая_местная_дорога": 1.0, "служебный_проезд": 1.1, "хозяйственная_дорога": 1.2,
+              "дорога_второго_значения": 1.3, "пешеходная_дорожка": 1.4, "пешеходная_улица": 1.3, "главная_дорога": 1.6}
 
 
 def by_type(roads):
@@ -78,8 +80,8 @@ def hop(graph, u, v, attr):
     return min(data[attr] for data in graph[u][v].values())
 
 
-def bidirectional(graph, source, target, weight):
-    return nx.bidirectional_dijkstra(graph, source, target, weight=weight)[1]
+def dijkstra(graph, source, target, weight):
+    return nx.dijkstra_path(graph, source, target, weight=weight)
 
 
 def astar(graph, source, target, weight):
@@ -118,12 +120,12 @@ def best_by_ml(prediction, limit=1.15):
 
 # --- own ML: a different model on the same open labels --------------------------------------------------
 
-def forest_feature(lab):
+def forest_feature(city):
     from sklearn.ensemble import RandomForestRegressor
-    known = lab.trips.notna()
-    x = features(lab.roads).drop(columns="длина_м")
+    known = city.trips.notna()
+    x = features(city.roads).drop(columns="длина_м")
     model = RandomForestRegressor(n_estimators=150, max_depth=12, min_samples_leaf=20, n_jobs=-1, random_state=0)
-    model.fit(x[known], np.log1p(lab.trips[known]), sample_weight=lab.roads["длина_м"][known])
+    model.fit(x[known], np.log1p(city.trips[known]), sample_weight=city.roads["длина_м"][known])
 
     def rf_popularity(roads):
         predicted = pd.Series(model.predict(features(roads).drop(columns="длина_м")), index=roads.index)
@@ -131,14 +133,14 @@ def forest_feature(lab):
     return rf_popularity
 
 
-def popular_classifier(lab):
+def popular_classifier(city):
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
-    known = lab.trips.notna()
-    x = features(lab.roads).drop(columns="длина_м")
+    known = city.trips.notna()
+    x = features(city.roads).drop(columns="длина_м")
     model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
-    model.fit(x[known], lab.popularity[known].ge(75))
+    model.fit(x[known], city.popularity[known].ge(75))
 
     def chance_popular(roads):
         return pd.DataFrame({"шанс_популярной": model.predict_proba(features(roads).drop(columns="длина_м"))[:, 1]},
@@ -146,19 +148,26 @@ def popular_classifier(lab):
     return chance_popular
 
 
-def ideas(lab):
-    model = train_popularity(lab)
+def ideas(city):
+    model = train_popularity(city)
     ml = ml_feature(model)
-    known_popularity = lab.popularity  # open zone only: closed roads are NaN here
+    known_popularity = city.popularity  # open zone only: closed roads are NaN here
 
     def cheat(roads):  # forbidden: the cost reads the target
         return roads["длина_м"] * (1.6 - known_popularity.reindex(roads.index).fillna(50) / 100)
 
-    prediction = model.predict_log_trips(lab.osm)
+    prediction = model.predict_log_trips(city.osm)
     by_hop = {}
-    for u, v, p in zip(lab.osm.u, lab.osm.v, prediction):
+    for u, v, p in zip(city.osm.u, city.osm.v, prediction):
         by_hop[(u, v)] = max(p, by_hop.get((u, v), -np.inf))
-    w = lambda weights, extra=(): comfort_cost(weights, extra=extra)
+    def w(weights, make=None):
+        def recipe(roads):
+            table = features(roads)
+            if make is not None:
+                additions = make(roads)
+                table[additions.columns] = additions
+            return table
+        return comfort_cost(weights, features=recipe)
     return {
         # block, idea, solution
         "веса: пример из ноутбука": ("веса", solution(w(BASE), turns="default")),
@@ -179,7 +188,7 @@ def ideas(lab):
         "повороты: min_turns": ("повороты", solution(w(BASE), turns="min_turns")),
         "повороты: налево 60 м": ("повороты", solution(w(BASE), turns={"left_penalty_m": 60, "right_penalty_m": 15})),
         "повороты: только на перекрёстках": ("повороты", solution(w(BASE), turns=junction_turns)),
-        "поиск: двусторонний Дейкстра": ("поиск", solution(w(BASE), turns=None, search=bidirectional)),
+        "поиск: Дейкстра": ("поиск", solution(w(BASE), turns=None, search=dijkstra)),
         "поиск: A*": ("поиск", solution(w(BASE), turns=None, search=astar)),
         "поиск: объезд не больше 15%": ("поиск", solution(w({"велодорожка": -0.8, "крупная_дорога": 1.0}), turns=None, search=within_detour)),
         "поиск: лучший из кандидатов по ML": ("поиск + ML", solution(w(BASE), turns=None, search=best_by_ml(by_hop))),
@@ -188,9 +197,9 @@ def ideas(lab):
         "ML: сила 1.5": ("ML", solution(w({**BASE, "ml_популярность": -1.5}, ml), turns=None)),
         "ML: только прогноз": ("ML", solution(w({"ml_популярность": -0.8}, ml), turns=None)),
         "ML: прогноз + min_turns": ("ML", solution(w({**BASE, "ml_популярность": -0.8}, ml), turns="min_turns")),
-        "ML: свой случайный лес": ("свой ML", solution(w({**BASE, "rf_популярность": -0.8}, forest_feature(lab)), turns=None)),
-        "ML: классификатор «популярная улица»": ("свой ML", solution(w({**BASE, "шанс_популярной": -0.8}, popular_classifier(lab)), turns=None)),
-        "ЗАПРЕЩЕНО: стоимость из lab.trips": ("нарушение правил", solution(cheat, turns=None)),
+        "ML: свой случайный лес": ("свой ML", solution(w({**BASE, "rf_популярность": -0.8}, forest_feature(city)), turns=None)),
+        "ML: классификатор «популярная улица»": ("свой ML", solution(w({**BASE, "шанс_популярной": -0.8}, popular_classifier(city)), turns=None)),
+        "ЗАПРЕЩЕНО: стоимость из city.trips": ("нарушение правил", solution(cheat, turns=None)),
         **{f"пресет: {name}": ("пресет", preset) for name, preset in presets().items()},
     }
 
@@ -203,11 +212,11 @@ def main():
     args = parser.parse_args()
     out = ROOT/"outputs/solution_ideas"/args.pack
     out.mkdir(parents=True, exist_ok=True)
-    lab = load_city(ROOT/"notebooks/data/hackathon"/args.pack)
-    closed = closed_city(lab, ROOT/"outputs/hackathon_private"/args.pack)
-    catalogue = ideas(lab)
+    city = load_city(ROOT/"notebooks/data/hackathon"/args.pack)
+    closed = closed_city(city, ROOT/"outputs/hackathon_private"/args.pack)
+    catalogue = ideas(city)
     tried = {name: entry[1] for name, entry in catalogue.items()}
-    results = {zone: score(z, tried, network=build_network(z, rideable)) for zone, z in (("open", lab), ("closed", closed))}
+    results = {zone: score(z, tried, network=build_network(z, rideable)) for zone, z in (("open", city), ("closed", closed))}
     rows = {}
     for name, (block, _) in catalogue.items():
         o, c = results["open"].table.loc[name], results["closed"].table.loc[name]
@@ -222,7 +231,7 @@ def main():
     table.to_csv(out/"ideas.csv")
     (out/"ideas.md").write_text(f"Кратчайший: открытая {base['open']}, закрытая {base['closed']}\n\n```\n"
                                 + table.to_string() + "\n```\n", encoding="utf-8")
-    print(f"кратчайший: открытая {base['open']}, закрытая {base['closed']}; пар {len(lab.pairs)} / {len(closed.pairs)}")
+    print(f"кратчайший: открытая {base['open']}, закрытая {base['closed']}; пар {len(city.pairs)} / {len(closed.pairs)}")
     print(table.to_string())
 
 

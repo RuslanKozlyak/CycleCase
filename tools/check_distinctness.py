@@ -28,7 +28,7 @@ BOOTS = 2000
 
 
 def edge_lengths(result):
-    length = dict(zip(zip(result.lab.osm.u, result.lab.osm.v, result.lab.osm.key), result.lab.osm.length_m))
+    length = dict(zip(zip(result.city.osm.u, result.city.osm.v, result.city.osm.key), result.city.osm.length_m))
     return {(r.algorithm, r.od_id): {tuple(map(int, e)): length[tuple(map(int, e))] for e in r.edge_route}
             for r in result.routes.itertuples()}
 
@@ -39,7 +39,7 @@ def similarity(results, names):
     count = 0
     for result in results.values():
         paths = edge_lengths(result)
-        for od in result.lab.pairs.od_id:
+        for od in result.city.pairs.od_id:
             sets = [paths.get((name, od), {}) for name in names]
             for i, a in enumerate(sets):
                 for j in range(i, len(sets)):
@@ -138,11 +138,11 @@ def main():
     args = parser.parse_args()
     out = ROOT/"outputs/solution_ideas"/args.pack
     out.mkdir(parents=True, exist_ok=True)
-    lab = load_city(ROOT/"notebooks/data/hackathon"/args.pack)
-    closed = closed_city(lab, ROOT/"outputs/hackathon_private"/args.pack)
-    tried = {name: entry[1] for name, entry in ideas(lab).items()}
+    city = load_city(ROOT/"notebooks/data/hackathon"/args.pack)
+    closed = closed_city(city, ROOT/"outputs/hackathon_private"/args.pack)
+    tried = {name: entry[1] for name, entry in ideas(city).items()}
     names = list(tried)
-    results = {zone: score(z, tried, network=build_network(z, rideable)) for zone, z in (("open", lab), ("closed", closed))}
+    results = {zone: score(z, tried, network=build_network(z, rideable)) for zone, z in (("open", city), ("closed", closed))}
 
     sim = similarity(results, ["shortest", *names])
     same_groups = groups(sim.drop(index="shortest", columns="shortest"))
@@ -167,8 +167,8 @@ def main():
     fair = [name for name in names if not name.startswith("ЗАПРЕЩЕНО")]
     closed_per_od = results["closed"].per_od
     summary = {
-        "pairs_per_zone": {zone: len(r.lab.pairs) for zone, r in results.items()},
-        "split": lab.manifest["split"],
+        "pairs_per_zone": {zone: len(r.city.pairs) for zone, r in results.items()},
+        "split": city.manifest["split"],
         "ideas_rank_agreement_open_closed": round(float(spearmanr(reports["open"].loc[fair, "популярность"],
                                                                   reports["closed"].loc[fair, "популярность"]).statistic), 3),
         "closed_routes_measured_in_zone_median_pct": round(float(closed_per_od[closed_per_od.algorithm.ne("shortest")]

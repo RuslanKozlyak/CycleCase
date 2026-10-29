@@ -8,14 +8,14 @@ import pytest
 from cycle_routing.grading import grade_all, load_submissions, submissions_table
 from cycle_routing.workshop import comfort_cost, export_solution, solution
 
-from test_workshop import bike, lab  # noqa: F401  (fixture)
+from test_workshop import bike, city  # noqa: F401  (fixture)
 
 matplotlib.use("Agg")
 
 
 @pytest.fixture
-def submissions(lab, tmp_path):
-    data, _ = lab
+def submissions(city, tmp_path):
+    data, _ = city
     folder = tmp_path / "submissions"
     export_solution(data, bike(), folder=folder / "велосипедисты")
     export_solution(data, solution(comfort_cost({"крупная_дорога": 0.1}), turns=None, label="почти кратчайший"),
@@ -30,8 +30,8 @@ def submissions(lab, tmp_path):
     return folder
 
 
-def test_submissions_load_with_a_status_for_each_team(lab, submissions):
-    data, _ = lab
+def test_submissions_load_with_a_status_for_each_team(city, submissions):
+    data, _ = city
     status = submissions_table(load_submissions(submissions, data))["статус"]
     assert status["велосипедисты"] == "ок" and status["архив"] == "ок"
     assert "submission.json" in status["пустая"] and "другого набора" in status["чужой набор"]
@@ -39,12 +39,12 @@ def test_submissions_load_with_a_status_for_each_team(lab, submissions):
     assert not (submissions.parent / "evil.txt").exists()
 
 
-def test_leaderboard_ranks_teams_on_the_closed_zone(lab, submissions):
-    data, private = lab
+def test_leaderboard_ranks_teams_on_the_closed_zone(city, submissions):
+    data, private = city
     board = grade_all(data, private, load_submissions(submissions, data))
     assert set(board.table.index) == {"велосипедисты", "архив", "кратчайший"}
     assert list(board.table.columns[:4]) == ["ярус", "популярность, закрытая зона", "±", "популярность, открытая зона"]
     assert board.table["ярус"].min() == 1 and board.table["популярность, открытая зона"].notna().all()
     assert set(board.errors.index) == {"пустая", "чужой набор", "взлом"}
-    assert board.result.lab.name == "закрытая зона" and set(board.result.routes.algorithm) == {"shortest", "велосипедисты", "архив"}
+    assert board.result.city.name == "закрытая зона" and set(board.result.routes.algorithm) == {"shortest", "велосипедисты", "архив"}
     board.plot()

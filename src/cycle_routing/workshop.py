@@ -3,8 +3,8 @@
 The notebook sees labels of the open zone only. The organizer keeps closed-zone OD and labels and
 scores an exported solution with exactly the same ``score``.
 
-Students see roads with Russian column names (``lab.roads``); files and the routing library keep the
-OSM names (``lab.osm``). Their own functions always receive the Russian table.
+Students see roads with Russian column names (``city.roads``); files and the routing library keep the
+OSM names (``city.osm``). Their own functions always receive the Russian table.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from functools import cached_property
 import hashlib
 import json
 from pathlib import Path
+import re
 
 import geopandas as gpd
 import numpy as np
@@ -38,14 +39,21 @@ OSM = {ru: name for name, ru in RU.items()}
 
 
 def russian(roads: pd.DataFrame) -> pd.DataFrame:
-    """Student view: Russian column names, no graph keys. Accepts OSM or already Russian names."""
+    """Student view: Russian column names and tag values, with underscores between words."""
     roads = osm(roads)
     view = roads[[c for c in [*RU, "geometry"] if c in roads]].rename(columns=RU)
+    for column, mapping in VALUE_NAMES.items():
+        if column in view:
+            view[column] = _translate_values(view[column], mapping)
     return view.rename_geometry("геометрия") if isinstance(view, gpd.GeoDataFrame) else view
 
 
 def osm(roads: pd.DataFrame) -> pd.DataFrame:
+    """Convert the student view back to OSM codes for routing and ready models."""
     table = roads.rename(columns=OSM)
+    for column, mapping in OSM_VALUES.items():
+        if column in roads:
+            table[OSM[column]] = _translate_values(table[OSM[column]], mapping)
     if isinstance(table, gpd.GeoDataFrame) and table.geometry.name == "геометрия":
         table = table.rename_geometry("geometry")
     return table
@@ -76,7 +84,7 @@ def rideable(roads: pd.DataFrame) -> pd.Series:
 
 
 @dataclass
-class Lab:
+class CityData:
     folder: Path
     osm: gpd.GeoDataFrame                  # OSM column names: files and routing
     nodes: gpd.GeoDataFrame
@@ -107,7 +115,7 @@ def _align(roads, labels, column="trips"):
     return labels.set_index("edge_id")[column].reindex(roads.edge_id).set_axis(roads.index).rename(column)
 
 
-def load_city(folder: str | Path) -> Lab:
+def load_city(folder: str | Path) -> CityData:
     """Read a prepared pack only. Never downloads or rebuilds the city in a student session."""
     folder = Path(folder)
     path = folder / "manifest.json"
@@ -126,50 +134,144 @@ def load_city(folder: str | Path) -> Lab:
     tracks = gpd.read_parquet(optional("tracks.parquet")) if optional("tracks.parquet") else None
     test_area = (_align(roads, pd.read_parquet(optional("test_area.parquet")), "test_area").fillna(False).astype(bool)
                  if optional("test_area.parquet") else pd.Series(False, index=roads.index, name="test_area"))
-    return Lab(folder, roads, nodes, pd.read_parquet(folder / "pairs.parquet"),
+    return CityData(folder, roads, nodes, pd.read_parquet(folder / "pairs.parquet"),
                _align(roads, pd.read_parquet(folder / "labels.parquet")), manifest, tracks, test_area)
 
 
-def closed_city(lab: Lab, private_folder: str | Path) -> Lab:
+def closed_city(city: CityData, private_folder: str | Path) -> CityData:
     """Organizer only: the same roads with the closed-zone OD and labels."""
     private = Path(private_folder)
     meta = json.loads((private / "dataset.json").read_text(encoding="utf-8"))
-    if meta["dataset_id"] != lab.manifest["dataset_id"]:
+    if meta["dataset_id"] != city.manifest["dataset_id"]:
         raise ValueError("Закрытые данные относятся к другому набору")
-    return Lab(lab.folder, lab.osm, lab.nodes, pd.read_parquet(private / "closed_pairs.parquet"),
-               _align(lab.osm, pd.read_parquet(private / "closed_labels.parquet")), lab.manifest,
+    return CityData(city.folder, city.osm, city.nodes, pd.read_parquet(private / "closed_pairs.parquet"),
+               _align(city.osm, pd.read_parquet(private / "closed_labels.parquet")), city.manifest,
                name="закрытая зона")
 
 
 KINDS = {"длина_м": "число, м", "макс_скорость": "число, км/ч", "полос": "число", "ширина_м": "число, м",
-         "одностороннее": "да/нет", "геометрия": "линия в метрах"}
+         "одностороннее": "да/нет", "геометрия": "линия"}
+
+# One reversible vocabulary for the student data and its dictionary.
+VALUE_LABELS = {
+    "тип_дороги": {
+        "cycleway": "велодорожка", "footway": "пешеходная дорожка", "path": "тропа",
+        "service": "служебный проезд", "residential": "жилая улица", "living_street": "жилая зона",
+        "pedestrian": "пешеходная улица", "steps": "лестница", "track": "хозяйственная дорога",
+        "primary": "главная дорога", "secondary": "дорога второго значения", "tertiary": "местная дорога",
+        "trunk": "скоростная дорога", "motorway": "автомагистраль", "unclassified": "прочая местная дорога",
+        "road": "дорога неизвестного типа", "bridleway": "конная дорожка", "bus_stop": "автобусная остановка",
+        "corridor": "коридор", "primary_link": "съезд с главной дороги",
+        "secondary_link": "съезд с дороги второго значения", "tertiary_link": "съезд с местной дороги",
+        "trunk_link": "съезд со скоростной дороги", "motorway_link": "съезд с автомагистрали",
+        "construction": "строящаяся дорога", "proposed": "предлагаемая дорога", "planned": "планируемая дорога",
+        "razed": "снесённая дорога", "abandoned": "заброшенная дорога", "platform": "платформа",
+        "elevator": "лифт", "escalator": "эскалатор", "bus_guideway": "направляемая автобусная дорога",
+        "raceway": "гоночная трасса", "busway": "автобусная дорога",
+    },
+    "покрытие": {
+        "asphalt": "асфальт", "paved": "твёрдое покрытие", "unpaved": "нет твёрдого покрытия",
+        "concrete": "бетон", "concrete:lanes": "бетонные колеи", "concrete:lines": "бетонные полосы",
+        "concrete:plates": "бетонные плиты", "paving_stones": "тротуарная плитка", "sett": "брусчатка",
+        "cobblestone": "булыжник", "unhewn_cobblestone": "необработанный булыжник", "compacted": "уплотнённая смесь",
+        "fine_gravel": "мелкий гравий", "gravel": "гравий", "ground": "грунт", "dirt": "грунт без покрытия",
+        "earth": "земля", "sand": "песок", "grass": "трава", "grass_paver": "газонная решётка",
+        "metal": "металл", "metal_grid": "металлическая решётка", "mud": "грязь", "pebblestone": "галька",
+        "rock": "скала", "stone": "камень", "rubber": "резина", "tartan": "спортивное покрытие",
+        "wood": "дерево", "woodchips": "щепа", "artificial_turf": "искусственный газон", "plastic": "пластик",
+        "building_passage": "проезд через здание (нестандартный тег)", "service": "служебный проезд (нестандартный тег)",
+        "3": "неопределённое покрытие (нестандартный тег)",
+    },
+    "ровность": {
+        "excellent": "отличная", "very_good": "очень хорошая", "good": "хорошая", "intermediate": "средняя",
+        "bad": "плохая", "very_bad": "очень плохая", "horrible": "ужасная", "very_horrible": "крайне плохая",
+        "impassable": "непроезжая", "thin_rollers": "для маленьких колёс", "thin_wheels": "для узких колёс",
+        "wheels": "для обычных колёс", "robust_wheels": "для прочных колёс", "high_clearance": "нужен высокий клиренс",
+        "off_road_wheels": "для внедорожных колёс", "specialized_off_road_wheels": "для специальных внедорожных колёс",
+    },
+    "велополоса": {
+        "yes": "есть", "no": "нет", "none": "отсутствует", "lane": "велополоса", "track": "отделённая велодорожка",
+        "separate": "велодорожка отдельной линией OSM", "share_busway": "совместно с автобусами",
+        "shared_lane": "совместная полоса с машинами", "crossing": "велопереезд", "designated": "предназначена для велосипедов",
+    },
+    "велосипед": {
+        "yes": "разрешён", "no": "запрещён", "designated": "предназначено для велосипедов",
+        "destination": "только к месту назначения", "permissive": "с разрешения владельца", "dismount": "спешиться",
+        "discouraged": "не рекомендуется", "use_sidepath": "использовать соседнюю велодорожку",
+        "agricultural": "только для сельхозработ", "forestry": "только для лесных работ", "unknown": "неизвестно",
+        "private": "частный доступ",
+    },
+    "освещение": {"yes": "есть", "no": "нет", "24/7": "круглосуточное", "automatic": "автоматическое", "limited": "ограниченное"},
+    "служебный_проезд": {
+        "driveway": "подъезд к зданию", "parking_aisle": "проезд по парковке", "alley": "узкий проезд",
+        "drive-through": "проезд через обслуживание", "emergency_access": "проезд экстренных служб",
+        "slipway": "спуск к воде", "tiefgarageneinfahrt": "въезд в подземный гараж", "yes": "служебный проезд",
+        "living_street": "проезд в жилой зоне",
+        "private": "частный проезд",
+    },
+    "доступ": {
+        "yes": "разрешён", "no": "запрещён", "private": "частный", "permissive": "с разрешения владельца",
+        "destination": "только к месту назначения", "customers": "только для клиентов", "delivery": "только для доставки",
+        "permit": "по пропуску", "designated": "для указанного транспорта", "agricultural": "только для сельхозработ",
+        "forestry": "только для лесных работ",
+    },
+}
 
 
-def data_dictionary(lab: Lab):
+VALUE_NAMES = {
+    column: {value: re.sub(r"[^\w]+", "_", label.lower()).strip("_") for value, label in mapping.items()}
+    for column, mapping in VALUE_LABELS.items()
+}
+OSM_VALUES = {column: {name: value for value, name in mapping.items()} for column, mapping in VALUE_NAMES.items()}
+
+
+def _translate_values(values, mapping):
+    # Translate each token independently: aggregated tags and missing values keep their meaning.
+    lookup = {value: ";".join(mapping.get(part, part) for part in value.split(";"))
+              for value in values.dropna().unique()}
+    translated = values.map(lookup, na_action="ignore")
+    if values.dtype == object or isinstance(values.dtype, pd.StringDtype):
+        return translated.astype(values.dtype)
+    return translated
+
+
+def _crs_description(crs):
+    """Explain the geometry using familiar words; keep technical CRS metadata in the data files."""
+    if crs is None:
+        return "линия дороги; единицы координат не указаны"
+    units = {axis.unit_name for axis in crs.axis_info}
+    if units == {"metre"}:
+        return "линия дороги; координаты в метрах"
+    if units == {"degree"}:
+        return "линия дороги; координаты в градусах"
+    return "линия дороги"
+
+
+def data_dictionary(city: CityData):
     """One row per column of ``city.roads``, like a competition data page, with every value of each category
     (most frequent first); the target is listed last. Shown wrapped, nothing cut."""
     rows = {}
-    for column in lab.roads.columns:
-        kind, values = KINDS.get(column, "категория"), lab.roads[column]
+    for column in city.roads.columns:
+        kind, values = KINDS.get(column, "категория"), city.roads[column]
         if column == "геометрия":
-            text = "EPSG:25832"
+            text = _crs_description(city.osm.crs)
         elif kind == "категория":
-            text = ", ".join(values.dropna().str.split(";").explode().value_counts().index)
+            text = ", ".join(values.dropna().astype("string").str.split(";").explode().value_counts().index)
         elif kind == "да/нет":
-            text = "True / False"
+            text = "да (True) / нет (False)"
         else:
             text = f"{values.min():g} … {values.max():g}"
         rows[column] = {"тип": kind, "значения": text + ("; пусто — нет данных" if values.isna().any() else "")}
-    rows["поездки (city.trips)"] = {"тип": "число, цель", "значения": f"{lab.trips.min():g} … {lab.trips.max():g}; "
+    rows["поездки (city.trips)"] = {"тип": "число, цель", "значения": f"{city.trips.min():g} … {city.trips.max():g}; "
                                     "пусто — не измерено; в city.roads не входит"}
     return (pd.DataFrame(rows).T.style
             .set_properties(**{"text-align": "left", "white-space": "normal"})
             .set_table_styles([{"selector": "th", "props": [("text-align", "left")]}]))
 
 
-def example_rows(lab: Lab) -> pd.DataFrame:
+def example_rows(city: CityData) -> pd.DataFrame:
     """The fewest rows in which every column has at least one filled value."""
-    table = lab.roads.drop(columns="геометрия")
+    table = city.roads.drop(columns="геометрия")
     filled = table.notna()
     left, chosen = set(filled.columns[filled.any()]), []
     while left:
@@ -191,115 +293,101 @@ def _typical_rows(table, n):
 
 @dataclass
 class Network:
-    lab: Lab
+    city: CityData
     roads: gpd.GeoDataFrame       # OSM roads routing uses: kept and connected
     removed: pd.Series            # removed by the filter
     cut_off: pd.Series            # kept, but not connected to the main piece: not used by routes
 
     def summary(self) -> str:
-        km = lambda mask: self.lab.osm.length_m[mask].sum() / 1000
+        km = lambda mask: self.city.osm.length_m[mask].sum() / 1000
         nodes = set(self.roads.u) | set(self.roads.v)
-        lost = int((~self.lab.pairs.origin.isin(nodes) | ~self.lab.pairs.destination.isin(nodes)).sum())
-        text = (f"Осталось {len(self.roads):,} участков ({self.roads.length_m.sum()/1000:.0f} км) из {len(self.lab.osm):,}. "
+        lost = int((~self.city.pairs.origin.isin(nodes) | ~self.city.pairs.destination.isin(nodes)).sum())
+        text = (f"Осталось {len(self.roads):,} участков ({self.roads.length_m.sum()/1000:.0f} км) из {len(self.city.osm):,}. "
                 f"Фильтр убрал {int(self.removed.sum()):,} ({km(self.removed):.0f} км), "
                 f"оторвано от основной сети и не используется {int(self.cut_off.sum()):,} ({km(self.cut_off):.0f} км).")
         return text + (f" Без маршрута останутся пары: {lost}." if lost else "")
 
 
-def build_network(lab: Lab, keep=None) -> Network:
+def build_network(city: CityData, keep=None) -> Network:
     """``keep(roads) -> Series[bool]``; None keeps the baseline network. Only the main connected piece is
     routed: from a cut-off piece you cannot reach the rest of the city (or come back, on one-way streets)."""
-    mask = lab.reference if keep is None else keep(lab.roads) if callable(keep) else keep
-    if not isinstance(mask, pd.Series) or not mask.index.equals(lab.osm.index) or mask.dtype != bool:
+    mask = city.reference if keep is None else keep(city.roads) if callable(keep) else keep
+    if not isinstance(mask, pd.Series) or not mask.index.equals(city.osm.index) or mask.dtype != bool:
         raise ValueError("Фильтр должен вернуть pd.Series из True/False с тем же индексом, что у roads")
-    kept = lab.osm[mask]
-    connected = pd.Series(False, index=lab.osm.index)
+    kept = city.osm[mask]
+    connected = pd.Series(False, index=city.osm.index)
     connected.loc[kept.index] = largest_component(kept, strongly=True).to_numpy()
-    return Network(lab, lab.osm[connected], ~mask, mask & ~connected)
+    return Network(city, city.osm[connected], ~mask, mask & ~connected)
 
 
 # --- solution blocks ----------------------------------------------------------------------------
 
 
 def features(roads: pd.DataFrame) -> pd.DataFrame:
-    """Ready features for weights, from OSM tags only (never from trips)."""
-    r = osm(roads)
-    f = pd.DataFrame(index=r.index)
-    f["длина_м"] = r.length_m
-    bike_values = r.cycleway.fillna("").str.split(";")
-    f["велодорожка"] = (has_any(r.highway, "cycleway")
-                        | bike_values.map(lambda values: bool(set(values) - {"", "no", "none", "separate"}))).astype(float)
-    f["крупная_дорога"] = has_any(r.highway, {"primary", "secondary", "trunk", "primary_link", "secondary_link"}).astype(float)
-    f["жилая_улица"] = has_any(r.highway, {"residential", "living_street"}).astype(float)
-    f["пешеходная"] = has_any(r.highway, {"footway", "pedestrian", "steps", "path"}).astype(float)
-    f["плохое_покрытие"] = (has_any(r.surface, {"sett", "cobblestone", "unpaved", "gravel", "ground", "dirt", "sand"})
-                            | has_any(r.smoothness, {"bad", "very_bad", "horrible", "impassable"})).astype(float)
-    f["без_освещения"] = has_any(r.lit, "no").astype(float)
-    f["узкая"] = (r.width.notna() & r.width.lt(2)).astype(float)
-    for source, name, default, missing in [("maxspeed", "скорость", 30., "скорость_неизвестна"),
-                                           ("lanes", "полосы", 1., "полосы_неизвестны"),
-                                           ("width", "ширина", 3., "ширина_неизвестна")]:
-        values = pd.to_numeric(r[source], errors="coerce")
-        f[missing] = values.isna().astype(float)
-        f[name] = values.fillna(default)
-    f["покрытие_неизвестно"] = r.surface.isna().astype(float)
+    """Length and three example indicators; the notebook supplies its editable function."""
+    roads = russian(roads)
+    f = pd.DataFrame(index=roads.index)
+    f["длина_м"] = roads["длина_м"]
+    f["велодорожка"] = has_any(roads["тип_дороги"], "велодорожка").astype(float)
+    f["крупная_дорога"] = has_any(
+        roads["тип_дороги"], {"главная_дорога", "дорога_второго_значения", "скоростная_дорога"}
+    ).astype(float)
+    f["асфальт"] = has_any(roads["покрытие"], "асфальт").astype(float)
     return f
 
 
-def feature_catalog() -> pd.DataFrame:
-    return pd.DataFrame({
-        "велодорожка": ("0/1", "тип_дороги = cycleway или велополоса на дороге"),
-        "крупная_дорога": ("0/1", "тип_дороги = primary, secondary, trunk"),
-        "жилая_улица": ("0/1", "тип_дороги = residential, living_street"),
-        "пешеходная": ("0/1", "тип_дороги = footway, pedestrian, steps, path"),
-        "плохое_покрытие": ("0/1", "брусчатка, грунт, гравий или плохая ровность"),
-        "без_освещения": ("0/1", "освещение = no"),
-        "узкая": ("0/1", "ширина_м < 2"),
-        "скорость": ("км/ч", "макс_скорость; нет данных → 30"),
-        "полосы": ("число", "полос; нет данных → 1"),
-        "ширина": ("м", "ширина_м; нет данных → 3"),
-        "скорость_неизвестна, полосы_неизвестны, ширина_неизвестна, покрытие_неизвестно": ("0/1", "в OSM нет тега"),
-    }, index=["значения", "из чего"]).T
+def _feature_table(roads, make_features):
+    table = make_features(russian(roads))
+    if not isinstance(table, pd.DataFrame) or not table.index.equals(roads.index):
+        raise ValueError("Признаки: функция должна вернуть pd.DataFrame с тем же индексом, что у roads")
+    return table.copy()
 
 
 @dataclass
 class ComfortCost:
     """``длина × max(0.1, 1 + Σ вес × признак)``: positive weights avoid a feature, negative prefer it."""
     weights: tuple
-    extra: tuple = ()
+    make_features: object = features
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if "make_features" not in state:
+            from .workshop_compat import restore_features
+            self.make_features = restore_features(state, features)
 
     def table(self, roads):
-        table = features(roads)
-        view = russian(roads) if self.extra else None
-        for make in self.extra:
-            more = make(view)
-            if not isinstance(more, pd.DataFrame) or not more.index.equals(table.index):
-                raise ValueError("Свои признаки: функция должна вернуть pd.DataFrame с тем же индексом, что у roads")
-            table[more.columns] = more
-        return table
+        return _feature_table(roads, self.make_features)
 
     def __call__(self, roads):
         table = self.table(roads)
         unknown = [name for name, _ in self.weights if name not in table]
         if unknown:
-            raise KeyError(f"Нет признака {unknown}. Доступны: {list(table.columns.drop('длина_м'))}")
+            raise KeyError(f"Нет признака {unknown}. Доступны: {list(table.columns)}")
         factor = pd.Series(1.0, index=table.index)
         for name, weight in self.weights:
             factor += weight * table[name].astype(float)
-        return (table["длина_м"] * factor.clip(lower=0.1)).rename("cost")
+        length = table["длина_м"] if "длина_м" in table else (
+            roads["длина_м"] if "длина_м" in roads else roads["length_m"]
+        )
+        return (length * factor.clip(lower=0.1)).rename("cost")
 
 
-def comfort_cost(weights: dict, extra=()) -> ComfortCost:
-    return ComfortCost(tuple(weights.items()), (extra,) if callable(extra) else tuple(extra))
+def comfort_cost(weights: dict, *, features=features) -> ComfortCost:
+    return ComfortCost(tuple(weights.items()), features)
 
 
 @dataclass
 class OwnCost:
     """A team's own cost function; it receives the Russian roads table."""
     function: object
+    _russian_values: bool = True
 
     def __call__(self, roads):
-        return pd.Series(self.function(russian(roads)), index=roads.index, name="cost")
+        view = russian(roads)
+        if not vars(self).get("_russian_values", False):
+            from .workshop_compat import legacy_roads
+            view = legacy_roads(roads)
+        return pd.Series(self.function(view), index=roads.index, name="cost")
 
 
 @dataclass
@@ -321,9 +409,9 @@ def _report(corr):
     print(f"Связь прогноза с реальной популярностью на отложенных улицах: {text} (1 — идеально, 0 — никакой)")
 
 
-def _held_out(lab, known, seed):
+def _held_out(city, known, seed):
     """Measured roads and the ~20% of ~1 km blocks held out for the check; None when the area is too small."""
-    roads = lab.osm[known]
+    roads = city.osm[known]
     try:
         return roads, spatial_partition(roads, pd.Series(True, index=roads.index), random_state=seed).eq("validation")
     except ValueError:
@@ -331,12 +419,12 @@ def _held_out(lab, known, seed):
         return roads, None
 
 
-def train_popularity(lab: Lab, *, max_iter=120, max_leaf_nodes=15, seed=42) -> PopularityModel:
+def train_popularity(city: CityData, *, max_iter=120, max_leaf_nodes=15, seed=42) -> PopularityModel:
     """The ready model: gradient boosting on OSM tags. Fit on measured open-zone roads; first report the fit on
     held-out ~1 km blocks."""
-    known = lab.trips.notna()
-    roads, held = _held_out(lab, known, seed)
-    trips = lab.trips[known]
+    known = city.trips.notna()
+    roads, held = _held_out(city, known, seed)
+    trips = city.trips[known]
     if held is not None:
         check = fit_popularity_model(roads[~held], trips[~held], max_iter=max_iter, max_leaf_nodes=max_leaf_nodes,
                                      random_state=seed)
@@ -346,34 +434,40 @@ def train_popularity(lab: Lab, *, max_iter=120, max_leaf_nodes=15, seed=42) -> P
 
 @dataclass
 class TrainedModel:
-    """A team's sklearn model fitted on the ready features plus their own ones."""
+    """A team's fitted model and the one feature function shared by training and prediction."""
     model: object
-    extra: tuple
     columns: list
+    make_features: object = features
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if "make_features" not in state:
+            from .workshop_compat import restore_features
+            self.make_features = restore_features(state, features)
 
     def features(self, roads):
-        return ComfortCost((), self.extra).table(roads)[self.columns]
+        return _feature_table(roads, self.make_features)[self.columns]
 
     def predict_log_trips(self, roads):
         return pd.Series(self.model.predict(self.features(roads)), index=roads.index, name="predicted_log_trips")
 
 
-def train_model(lab: Lab, model, *, extra=(), seed=42) -> TrainedModel:
-    """Your own model: any sklearn object with fit/predict (a regressor or a Pipeline). It learns log(1 + trips) of
-    measured open-zone roads from the ready features and your own (``extra=my_features``); first the fit is checked
-    on held-out ~1 km blocks. ``ml_feature(...)`` turns its prediction into the feature ``ml_популярность``."""
-    from sklearn.base import clone
-    extra = (extra,) if callable(extra) else tuple(extra)
-    known = lab.trips.notna()
-    table = ComfortCost((), extra).table(lab.osm)
-    columns = [c for c in table.columns if c != "длина_м"]
-    x, y = table.loc[known, columns], np.log1p(lab.trips[known])
-    roads, held = _held_out(lab, known, seed)
+def train_custom_model(city: CityData, train, *, features=features, seed=42) -> TrainedModel:
+    """Prepare OSM features and log(1 + trips), then call ``train(x, y) -> fitted model``.
+
+    The notebook owns fitting. This service handles missing labels, spatial validation and reuse of
+    the same features for prediction. ``train`` creates a fresh model on each call.
+    """
+    known = city.trips.notna()
+    table = _feature_table(city.osm, features)
+    columns = list(table.columns)
+    x, y = table.loc[known, columns], np.log1p(city.trips[known])
+    roads, held = _held_out(city, known, seed)
     print("Признаки модели:", ", ".join(columns))
     if held is not None and held.any() and not held.all():
-        check = clone(model).fit(x[~held.to_numpy()], y[~held.to_numpy()])
+        check = train(x.loc[~held], y.loc[~held])
         _report(weighted_corr(check.predict(x[held.to_numpy()]), y[held.to_numpy()], roads.length_m[held]))
-    return TrainedModel(clone(model).fit(x, y), extra, columns)
+    return TrainedModel(train(x, y), columns, features)
 
 
 def solution(cost, *, turns="default", search="dijkstra", label=None) -> dict:
@@ -386,37 +480,39 @@ def presets(*names) -> dict:
     return {name: COMFORT_PRESETS[name] for name in (names or tuple(COMFORT_PRESETS))}
 
 
-def _example_roads(lab, table, names, n):
+def _example_roads(city, table, names, n):
     """A plain typical road, then a road where each named feature is present, padded with typical roads."""
-    typical = _typical_rows(lab.roads, n)
-    filled, chosen = lab.roads.notna().sum(axis=1), []
+    typical = _typical_rows(city.roads, n)
+    filled, chosen = city.roads.notna().sum(axis=1), []
     for name in names:
         present = filled[table[name].ne(0) & ~filled.index.isin(chosen)]
         if len(present):
             chosen.append(present.idxmax())
     plain = [row for row in typical if row not in chosen and table.loc[row, names].eq(0).all()][:1]
-    return plain + chosen + [row for row in typical if row not in chosen + plain][: max(0, n - len(chosen) - len(plain))]
+    rows = plain + chosen + [row for row in typical if row not in chosen + plain]
+    return rows[:n]
 
 
-def preview_features(lab: Lab, extra, n: int = 5) -> pd.DataFrame:
-    """Roads where your own features are present: check them before giving them a weight."""
-    table = comfort_cost({}, extra=extra).table(lab.osm)
-    names = [c for c in table.columns if c not in features(lab.osm.iloc[:0])]
-    return lab.roads.loc[_example_roads(lab, table, names, n), ["тип_дороги"]].join(table[names])
+def preview_features(city: CityData, features=features, n: int = 5) -> pd.DataFrame:
+    """Show the supplied features on representative roads, before choosing their weights."""
+    table = _feature_table(city.osm, features)
+    names = [c for c in table.columns if c != "длина_м"]
+    return city.roads.loc[_example_roads(city, table, names, n), ["тип_дороги"]].join(table)
 
 
-def preview_cost(lab: Lab, cost, n: int = 5, extra=()) -> pd.DataFrame:
+def preview_cost(city: CityData, cost, n: int = 5, *, features=features) -> pd.DataFrame:
     """Quick check without routing: a road for each feature that counts, the features and the cost in the last
-    column. For your own formula pass ``extra=my_features`` to see your features next to the cost."""
+    column. ``features`` is the same single feature function used by the solution."""
     if isinstance(cost, ComfortCost):
-        values = cost(lab.osm)
-        table, names = cost.table(lab.osm), [name for name, _ in cost.weights]
+        values = cost(city.osm)
+        table, names = cost.table(city.osm), [name for name, _ in cost.weights]
     else:
-        values = (cost if isinstance(cost, OwnCost) else OwnCost(cost))(lab.osm)
-        table = comfort_cost({}, extra=extra).table(lab.osm)
-        names = [c for c in table.columns if c not in features(lab.osm.iloc[:0])]
-    rows = _example_roads(lab, table, names, n)
-    result = lab.roads.loc[rows, ["тип_дороги"]].join(table.loc[rows, names + ["длина_м"]])
+        values = (cost if isinstance(cost, OwnCost) else OwnCost(cost))(city.osm)
+        table = _feature_table(city.osm, features)
+        names = [c for c in table.columns if c != "длина_м"]
+    rows = _example_roads(city, table, names, n)
+    result = city.roads.loc[rows, ["тип_дороги"]].join(table.loc[rows, names])
+    result["длина_м"] = city.roads.loc[rows, "длина_м"]
     result["цена 1 м"] = (values.loc[rows] / result["длина_м"]).round(2)
     result["стоимость"] = values.loc[rows].round(1)
     return result.round({"длина_м": 1})
@@ -431,7 +527,7 @@ class Result:
     per_od: pd.DataFrame
     routes: gpd.GeoDataFrame
     solutions: dict
-    lab: Lab
+    city: CityData
     network: Network
 
     def plot(self):
@@ -447,9 +543,9 @@ class Result:
         return fig
 
 
-def _per_od(lab, routes, names, max_detour_pct):
-    lookup = pd.DataFrame({"length": lab.osm.length_m.to_numpy(), "pop": lab.popularity.to_numpy(),
-                           "bad": (~is_rideable(lab.osm)).to_numpy()}, index=pd.MultiIndex.from_frame(lab.osm[KEY]))
+def _per_od(city, routes, names, max_detour_pct):
+    lookup = pd.DataFrame({"length": city.osm.length_m.to_numpy(), "pop": city.popularity.to_numpy(),
+                           "bad": (~is_rideable(city.osm)).to_numpy()}, index=pd.MultiIndex.from_frame(city.osm[KEY]))
     rows = []
     for route in routes.itertuples():
         used = lookup.loc[[tuple(int(x) for x in edge) for edge in route.edge_route]]
@@ -458,7 +554,7 @@ def _per_od(lab, routes, names, max_detour_pct):
                      "turns": route.turns, "search_ms": route.search_ms, "bad_m": used.length[used.bad].sum(),
                      "coverage_pct": 100 * used.length[known].sum() / used.length.sum(),
                      "popularity": np.average(used["pop"].fillna(UNKNOWN_POPULARITY), weights=used.length)})
-    grid = pd.MultiIndex.from_product([names, lab.pairs.od_id], names=["algorithm", "od_id"])
+    grid = pd.MultiIndex.from_product([names, city.pairs.od_id], names=["algorithm", "od_id"])
     d = pd.DataFrame(rows).set_index(["algorithm", "od_id"]).reindex(grid).reset_index()
     base = d[d.algorithm.eq("shortest")].set_index("od_id")
     d = d.join(base[["length_m", "popularity"]].add_prefix("shortest_"), on="od_id")
@@ -488,7 +584,7 @@ def _table(per_od, solutions):
     return table.astype({c: float for c in digits}).round(digits)
 
 
-def score(lab: Lab, solutions: dict, *, network: Network | None = None, max_detour_pct=MAX_DETOUR_PCT,
+def score(city: CityData, solutions: dict, *, network: Network | None = None, max_detour_pct=MAX_DETOUR_PCT,
           progress: bool = True) -> Result:
     """Route every solution on every OD and compare with the shortest path of the baseline network.
 
@@ -498,15 +594,15 @@ def score(lab: Lab, solutions: dict, *, network: Network | None = None, max_deto
     """
     if "shortest" in solutions:
         raise ValueError("Имя shortest зарезервировано для кратчайшего пути")
-    network = network or build_network(lab)
-    cache = lab.folder / "route_cache"
-    frames = [build_routes(lab.osm[lab.reference], lab.nodes, lab.pairs, {}, cache_dir=cache)]
+    network = network or build_network(city)
+    cache = city.folder / "route_cache"
+    frames = [build_routes(city.osm[city.reference], city.nodes, city.pairs, {}, cache_dir=cache)]
     if solutions:
-        own = build_routes(network.roads, lab.nodes, lab.pairs, solutions, cache_dir=cache, progress=progress)
+        own = build_routes(network.roads, city.nodes, city.pairs, solutions, cache_dir=cache, progress=progress)
         frames.append(own[own.algorithm.ne("shortest")])
-    routes = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), geometry="geometry", crs=lab.osm.crs)
-    per_od = _per_od(lab, routes, ["shortest", *solutions], max_detour_pct)
-    return Result(_table(per_od, solutions), per_od, routes, solutions, lab, network)
+    routes = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), geometry="geometry", crs=city.osm.crs)
+    per_od = _per_od(city, routes, ["shortest", *solutions], max_detour_pct)
+    return Result(_table(per_od, solutions), per_od, routes, solutions, city, network)
 
 
 def gpx_overlap(routes: gpd.GeoDataFrame, tracks: gpd.GeoDataFrame, buffer_m: float = 30) -> pd.DataFrame:
@@ -534,16 +630,16 @@ def gpx_table(result: Result, tracks: gpd.GeoDataFrame, buffer_m: float = 30) ->
 # --- export -------------------------------------------------------------------------------------
 
 
-def export_solution(lab: Lab, chosen: dict, *, keep=None, folder) -> Path:
+def export_solution(city: CityData, chosen: dict, *, keep=None, folder) -> Path:
     """Save the solution (functions included) and the filter; the organizer runs it on the closed zone."""
     import cloudpickle
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
-    payload = cloudpickle.dumps({"solution": chosen, "keep": keep})
+    payload = cloudpickle.dumps({"solution": chosen, "keep": keep, "data_language": "ru_values_v1"})
     cloudpickle.loads(payload)
     (folder / "solution.pkl").write_bytes(payload)
     (folder / "submission.json").write_text(json.dumps({
-        "dataset_id": lab.manifest["dataset_id"], "label": chosen.get("label"),
+        "dataset_id": city.manifest["dataset_id"], "label": chosen.get("label"),
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     return folder
 
@@ -551,14 +647,18 @@ def export_solution(lab: Lab, chosen: dict, *, keep=None, folder) -> Path:
 def load_submission(folder):
     import cloudpickle
     payload = cloudpickle.loads((Path(folder) / "solution.pkl").read_bytes())
-    return payload["solution"], payload["keep"]
+    keep = payload["keep"]
+    if payload.get("data_language") != "ru_values_v1" and keep is not None:
+        from .workshop_compat import LegacyFilter
+        keep = LegacyFilter(keep)
+    return payload["solution"], keep
 
 
-def grade(lab: Lab, private_folder, submission) -> Result:
+def grade(city: CityData, private_folder, submission) -> Result:
     """Organizer: run an exported solution on the closed zone with the same rules."""
     meta = json.loads((Path(submission) / "submission.json").read_text(encoding="utf-8"))
-    if meta["dataset_id"] != lab.manifest["dataset_id"]:
+    if meta["dataset_id"] != city.manifest["dataset_id"]:
         raise ValueError("Решение подготовлено для другого набора данных")
-    closed = closed_city(lab, private_folder)
+    closed = closed_city(city, private_folder)
     chosen, keep = load_submission(submission)
     return score(closed, {"решение": chosen}, network=build_network(closed, keep))

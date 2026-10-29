@@ -17,6 +17,7 @@ from scipy.stats import spearmanr
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/"src"))
 from cycle_routing.workshop import closed_city, comfort_cost, load_city, presets, score, solution
+from cycle_routing.workshop_compat import legacy_features
 
 
 def candidates():
@@ -24,7 +25,7 @@ def candidates():
     variants = {"w_bike0": {**base, "велодорожка": 0}, "w_bike_strong": {**base, "велодорожка": -0.8},
                 "w_major0": {**base, "крупная_дорога": 0}, "w_major2": {**base, "крупная_дорога": 2},
                 "w_rough2": {**base, "плохое_покрытие": 2}}
-    return {**presets(), **{name: solution(comfort_cost(w), turns=None, label=name) for name, w in variants.items()}}
+    return {**presets(), **{name: solution(comfort_cost(w, features=legacy_features), turns=None, label=name) for name, w in variants.items()}}
 
 
 def agreement(per_open, per_closed, rng, boots=1000):
@@ -42,16 +43,16 @@ def agreement(per_open, per_closed, rng, boots=1000):
             "same_zone_random_halves_median": round(float(np.median(halves)), 3)}
 
 
-def draw(lab, zones, closed, out):
+def draw(city, zones, closed, out):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from cycle_routing.routing import build_routes
     fig, ax = plt.subplots(figsize=(12, 12), layout="constrained")
     for name, color in {"open": "#93c5fd", "closed": "#fdba74", "buffer": "#d1d5db"}.items():
-        lab.osm[zones.eq(name).to_numpy()].plot(ax=ax, color=color, linewidth=0.4)
-    for zone_lab, color in ((lab, "#1d4ed8"), (closed, "#c2410c")):
-        build_routes(lab.osm[lab.reference], lab.nodes, zone_lab.pairs, {}, cache_dir=lab.folder/"route_cache").plot(
+        city.osm[zones.eq(name).to_numpy()].plot(ax=ax, color=color, linewidth=0.4)
+    for zone_lab, color in ((city, "#1d4ed8"), (closed, "#c2410c")):
+        build_routes(city.osm[city.reference], city.nodes, zone_lab.pairs, {}, cache_dir=city.folder/"route_cache").plot(
             ax=ax, color=color, linewidth=1.6)
     counts = zones.value_counts()
     ax.set_title(f"Открытая зона (синяя) {counts.get('open', 0):,} участков, закрытая (оранж.) {counts.get('closed', 0):,},"
@@ -69,20 +70,20 @@ def main():
     args = parser.parse_args()
     out = ROOT/"outputs/zone_planning"/args.pack
     out.mkdir(parents=True, exist_ok=True)
-    lab = load_city(ROOT/"notebooks/data/hackathon"/args.pack)
+    city = load_city(ROOT/"notebooks/data/hackathon"/args.pack)
     private = ROOT/"outputs/hackathon_private"/args.pack
-    closed = closed_city(lab, private)
-    zones = pd.read_parquet(private/"zones.parquet").set_index("edge_id").zone.reindex(lab.osm.edge_id)
+    closed = closed_city(city, private)
+    zones = pd.read_parquet(private/"zones.parquet").set_index("edge_id").zone.reindex(city.osm.edge_id)
     tried = candidates()
-    results = {"open": score(lab, tried), "closed": score(closed, tried)}
+    results = {"open": score(city, tried), "closed": score(closed, tried)}
     for zone, result in results.items():
         result.table.to_csv(out/f"{zone}_table.csv")
-        print(f"\n{zone}: {len(result.lab.pairs)} OD\n{result.table.to_string()}")
-    city_km = {z: round(lab.osm.length_m[zones.eq(z).to_numpy()].sum()/1000, 1) for z in ("open", "closed", "buffer")}
-    report = {"pack": args.pack, "split": lab.manifest["split"], "pairs": {z: len(r.lab.pairs) for z, r in results.items()},
+        print(f"\n{zone}: {len(result.city.pairs)} OD\n{result.table.to_string()}")
+    city_km = {z: round(city.osm.length_m[zones.eq(z).to_numpy()].sum()/1000, 1) for z in ("open", "closed", "buffer")}
+    report = {"pack": args.pack, "split": city.manifest["split"], "pairs": {z: len(r.city.pairs) for z, r in results.items()},
               "zone_km": city_km, **agreement(results["open"].per_od, results["closed"].per_od, np.random.default_rng(args.seed))}
     (out/"report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    draw(lab, zones, closed, out/"zones_map.png")
+    draw(city, zones, closed, out/"zones_map.png")
     print("\n" + json.dumps(report, ensure_ascii=False, indent=2))
 
 

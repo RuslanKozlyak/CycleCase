@@ -32,6 +32,8 @@ def package(destination, pack=None):
         raise ValueError("Unexpected private data in student archive")
     # The organizer's executed copy may show the personal SPb block; students get a notebook without outputs.
     notebook = nbformat.read(ROOT/"notebooks/hackathon_konstanz.ipynb", as_version=4)
+    # The local SPb example requires personal data; the student pack contains Konstanz only.
+    notebook.cells = [cell for cell in notebook.cells if "local-spb" not in cell.metadata.get("tags", [])]
     for cell in notebook.cells:
         if cell.cell_type == "code":
             cell.outputs, cell.execution_count = [], None

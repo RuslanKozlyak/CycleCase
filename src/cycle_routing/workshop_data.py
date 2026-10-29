@@ -26,7 +26,7 @@ def _digest(folder, names):
     return {name: hashlib.sha256((folder / name).read_bytes()).hexdigest() for name in names}
 
 
-def write_lab_pack(roads, nodes, pairs, trips, zone, *, folder, private_folder=None, city, split_params, tracks=None):
+def write_city_pack(roads, nodes, pairs, trips, zone, *, folder, private_folder=None, city, split_params, tracks=None):
     """``pairs`` carries a ``zone`` column; only ``open`` pairs and open-zone labels become public."""
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
@@ -88,7 +88,7 @@ def prepare_konstanz(*, source_cache, folder, private_folder, split="routes", ca
     roads, nodes, trips = konstanz_roads(source_cache)
     make = SPLITS[split] if isinstance(split, str) else split
     result = make(roads, nodes, trips.notna(), rideable=reference_roads(roads), cache=candidates_cache, **params)
-    return write_lab_pack(roads, nodes, result.pairs, trips, result.zone, folder=folder, private_folder=private_folder,
+    return write_city_pack(roads, nodes, result.pairs, trips, result.zone, folder=folder, private_folder=private_folder,
                           city="konstanz", split_params=result.params)
 
 
@@ -121,6 +121,6 @@ def prepare_spb_from_graph(*, source_graph, gpx_directory, folder, margin_m=2000
     snapped = snap_tracks_to_edges(edges, tracks, step_m=spec.observations.step_m, max_distance_m=spec.observations.max_distance_m)
     trips = track_edge_usage(snapped, edges)
     zone = pd.Series("open", index=edges.index)
-    manifest = write_lab_pack(edges, nodes, pairs.assign(zone="open"), trips, zone, folder=folder, city="saint_petersburg",
+    manifest = write_city_pack(edges, nodes, pairs.assign(zone="open"), trips, zone, folder=folder, city="saint_petersburg",
                               split_params={"method": "external", "source_graph": Path(source_graph).name}, tracks=tracks)
     return manifest

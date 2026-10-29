@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from .workshop import Lab, Result, build_network, closed_city, load_submission, score
+from .workshop import CityData, Result, build_network, closed_city, load_submission, score
 
 BOOTS = 2000
 COLUMNS = ["популярность", "популярнее кратчайшего", "объезд, %", "поворотов", "неудобные участки, м",
@@ -45,7 +45,7 @@ def _unzip(path: Path, target: Path) -> Path:
     return target
 
 
-def load_submissions(folder, lab: Lab) -> list[Submission]:
+def load_submissions(folder, city: CityData) -> list[Submission]:
     """Every subfolder or ZIP in ``folder`` is one team, named after it. Broken ones are kept with a status."""
     folder = Path(folder)
     found = []
@@ -60,7 +60,7 @@ def load_submissions(folder, lab: Lab) -> list[Submission]:
             if meta_path is None:
                 raise ValueError("нет submission.json: пришлите папку из export_solution")
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            if meta.get("dataset_id") != lab.manifest["dataset_id"]:
+            if meta.get("dataset_id") != city.manifest["dataset_id"]:
                 raise ValueError("решение сделано для другого набора данных")
             chosen, keep = load_submission(meta_path.parent)
             found.append(Submission(team, meta_path.parent, chosen, keep))
@@ -115,9 +115,9 @@ class Leaderboard:
         return fig
 
 
-def grade_all(lab: Lab, private_folder, submissions: list[Submission], *, with_open=True, seed=0) -> Leaderboard:
+def grade_all(city: CityData, private_folder, submissions: list[Submission], *, with_open=True, seed=0) -> Leaderboard:
     """Score every loaded submission on the closed zone (and, for reference, on the open one)."""
-    closed = closed_city(lab, private_folder)
+    closed = closed_city(city, private_folder)
     per_od, routes, rows, solutions, errors, base, open_shortest = [], [], {}, {}, {}, None, np.nan
     for s in tqdm(submissions, desc="Команды"):
         if s.solution is None:
@@ -132,7 +132,7 @@ def grade_all(lab: Lab, private_folder, submissions: list[Submission], *, with_o
             rows[s.team] = result.table.loc[s.team]
             solutions[s.team] = chosen
             if with_open:
-                seen = score(lab, {s.team: chosen}, network=build_network(lab, s.keep), progress=False).table
+                seen = score(city, {s.team: chosen}, network=build_network(city, s.keep), progress=False).table
                 rows[s.team]["открытая зона"], open_shortest = seen.loc[s.team, "популярность"], seen.loc["кратчайший", "популярность"]
         except Exception as error:
             errors[s.team] = f"ошибка при оценке: {error}"
@@ -141,7 +141,7 @@ def grade_all(lab: Lab, private_folder, submissions: list[Submission], *, with_o
         return Leaderboard(pd.DataFrame(), errors, None)
     per_od = pd.concat([base.per_od[base.per_od.algorithm.eq("shortest")], *per_od], ignore_index=True)
     routes = gpd.GeoDataFrame(pd.concat([base.routes[base.routes.algorithm.eq("shortest")], *routes], ignore_index=True),
-                              geometry="geometry", crs=lab.osm.crs)
+                              geometry="geometry", crs=city.osm.crs)
     rows["кратчайший"] = base.table.loc["кратчайший"].copy()
     rows["кратчайший"]["открытая зона"] = open_shortest
     names = ["shortest", *solutions]

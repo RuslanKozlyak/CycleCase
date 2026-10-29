@@ -126,6 +126,9 @@ def turn_graph(graph, turns) -> nx.DiGraph:
     result = nx.DiGraph()
     for u, v, key, cost in graph.edges(keys=True, data=WEIGHT):
         edge = (u, v, key)
+        # Search heuristics can use coordinates in both the street and the turn graph.
+        for node, street_node in [(("start", u), u), (edge, v), (("end", v), v)]:
+            result.add_node(node, x=graph.nodes[street_node]["x"], y=graph.nodes[street_node]["y"])
         result.add_edge(("start", u), edge, **{WEIGHT: cost})
         result.add_edge(edge, ("end", v), **{WEIGHT: 0.0})
         for _, after, after_key, after_cost in graph.out_edges(v, keys=True, data=WEIGHT):
