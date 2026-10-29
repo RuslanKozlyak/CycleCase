@@ -31,6 +31,12 @@ from .tags import has_any
 KEY = ["u", "v", "key"]
 FORMAT_VERSION = 2
 UNKNOWN_POPULARITY = 50.0  # a road without measurement counts as an average measured road
+# Route composition: what popularity does not see. Shares of route length, in percent.
+BUSY_ROADS = {"motorway", "trunk", "primary", "secondary",
+              "motorway_link", "trunk_link", "primary_link", "secondary_link"}
+BIKE_LANES = {"lane", "track", "separate", "shared_lane", "share_busway",
+              "opposite_lane", "opposite_track"}
+CALM_KMH = 30.0
 TARGETS = {"trips", "has_observation", "popularity"}
 RU = {"length_m": "длина_м", "highway": "тип_дороги", "surface": "покрытие", "smoothness": "ровность",
       "cycleway": "велополоса", "bicycle": "велосипед", "lit": "освещение", "service": "служебный_проезд",
@@ -551,16 +557,33 @@ class Result:
         return fig
 
 
+def _composition(city) -> pd.DataFrame:
+    """Per edge: the route qualities popularity cannot see (busy, calm, bike infrastructure)."""
+    speed = pd.to_numeric(city.osm.maxspeed, errors="coerce") if "maxspeed" in city.osm else pd.Series(np.nan, index=city.osm.index)
+    return pd.DataFrame({
+        "busy": has_any(city.osm.highway, BUSY_ROADS).to_numpy(),
+        "calm": speed.le(CALM_KMH).fillna(False).to_numpy(),
+        "bike": (has_any(city.osm.cycleway, BIKE_LANES) | has_any(city.osm.bicycle, {"designated"})).to_numpy(),
+    }, index=city.osm.index)
+
+
 def _per_od(city, routes, names):
+    parts = _composition(city)
     lookup = pd.DataFrame({"length": city.osm.length_m.to_numpy(), "pop": city.popularity.to_numpy(),
-                           "bad": (~is_rideable(city.osm)).to_numpy()}, index=pd.MultiIndex.from_frame(city.osm[KEY]))
+                           "bad": (~is_rideable(city.osm)).to_numpy(), **{c: parts[c].to_numpy() for c in parts}},
+                          index=pd.MultiIndex.from_frame(city.osm[KEY]))
     rows = []
     for route in routes.itertuples():
         used = lookup.loc[[tuple(int(x) for x in edge) for edge in route.edge_route]]
         known = used["pop"].notna()
+        total = used.length.sum()
         rows.append({"algorithm": route.algorithm, "od_id": route.od_id, "length_m": route.route_length_m,
                      "turns": route.turns, "search_ms": route.search_ms, "bad_m": used.length[used.bad].sum(),
-                     "coverage_pct": 100 * used.length[known].sum() / used.length.sum(),
+                     "coverage_pct": 100 * used.length[known].sum() / total,
+                     "busy_pct": 100 * used.length[used.busy].sum() / total,
+                     "calm_pct": 100 * used.length[used.calm].sum() / total,
+                     "bike_pct": 100 * used.length[used.bike].sum() / total,
+                     "straight_m": route.route_length_m / max(route.turns, 1),
                      "popularity": np.average(used["pop"].fillna(UNKNOWN_POPULARITY), weights=used.length)})
     grid = pd.MultiIndex.from_product([names, city.pairs.od_id], names=["algorithm", "od_id"])
     d = pd.DataFrame(rows).set_index(["algorithm", "od_id"]).reindex(grid).reset_index()
@@ -588,11 +611,17 @@ def _table(per_od, solutions):
             "популярнее кратчайшего": "—" if name == "shortest" else f"{better} из {len(d)}",
             "объезд, %": d.detour_pct.median(),
             "поворотов": d.turns.mean(),
+            "метров без поворота": d.straight_m.mean(),
+            "крупные дороги, %": d.busy_pct.mean(),
+            "до 30 км/ч, %": d.calm_pct.mean(),
+            "велоинфраструктура, %": d.bike_pct.mean(),
             "неудобные участки, м": d.bad_m.sum(),
             "время поиска, мс": d.search_ms.median(),
         }
     table = pd.DataFrame(rows).T
-    digits = {"популярность": 1, "длина, км": 3, "объезд, %": 1, "поворотов": 1, "неудобные участки, м": 0, "время поиска, мс": 2}
+    digits = {"популярность": 1, "длина, км": 3, "объезд, %": 1, "поворотов": 1, "метров без поворота": 0,
+              "крупные дороги, %": 1, "до 30 км/ч, %": 1, "велоинфраструктура, %": 1,
+              "неудобные участки, м": 0, "время поиска, мс": 2}
     table = table.astype({"Парето": bool, **{c: float for c in digits}})
     return table.sort_values(["Парето", "длина, км"], ascending=[False, True]).round(digits)
 
