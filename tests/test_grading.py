@@ -43,8 +43,11 @@ def test_leaderboard_ranks_teams_on_the_closed_zone(city, submissions):
     data, private = city
     board = grade_all(data, private, load_submissions(submissions, data))
     assert set(board.table.index) == {"велосипедисты", "архив", "кратчайший"}
-    assert list(board.table.columns[:4]) == ["ярус", "популярность, закрытая зона", "±", "популярность, открытая зона"]
-    assert board.table["ярус"].min() == 1 and board.table["популярность, открытая зона"].notna().all()
+    assert list(board.table.columns[:4]) == ["Парето", "популярность, закрытая зона", "±", "ярус популярности"]
+    assert board.table["ярус популярности"].min() == 1 and board.table["популярность, открытая зона"].notna().all()
+    assert board.table["Парето"].dtype == bool and "длина, км" in board.table
+    assert board.table["Парето"].equals(board.pareto["Парето"].reindex(board.table.index))
     assert set(board.errors.index) == {"пустая", "чужой набор", "взлом"}
     assert board.result.city.name == "закрытая зона" and set(board.result.routes.algorithm) == {"shortest", "велосипедисты", "архив"}
     board.plot()
+    board.plot_pareto()

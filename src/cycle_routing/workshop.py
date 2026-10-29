@@ -23,13 +23,13 @@ import pandas as pd
 from .evaluation import weighted_corr
 from .graph import is_rideable, largest_component
 from .learning import PopularityModel, fit_popularity_model, spatial_partition
+from .pareto import pareto_table, plot_pareto
 from .presets import COMFORT_PRESETS
 from .routing import build_routes
 from .tags import has_any
 
 KEY = ["u", "v", "key"]
 FORMAT_VERSION = 2
-MAX_DETOUR_PCT = 20
 UNKNOWN_POPULARITY = 50.0  # a road without measurement counts as an average measured road
 TARGETS = {"trips", "has_observation", "popularity"}
 RU = {"length_m": "длина_м", "highway": "тип_дороги", "surface": "покрытие", "smoothness": "ровность",
@@ -530,6 +530,14 @@ class Result:
     city: CityData
     network: Network
 
+    @property
+    def pareto(self):
+        """Unrounded popularity/distance comparison on every original OD."""
+        return pareto_table(self.per_od, {"shortest": "кратчайший"})
+
+    def plot_pareto(self):
+        return plot_pareto(self.pareto)
+
     def plot(self):
         import matplotlib.pyplot as plt
         values = self.table["популярность"].sort_values()
@@ -543,7 +551,7 @@ class Result:
         return fig
 
 
-def _per_od(city, routes, names, max_detour_pct):
+def _per_od(city, routes, names):
     lookup = pd.DataFrame({"length": city.osm.length_m.to_numpy(), "pop": city.popularity.to_numpy(),
                            "bad": (~is_rideable(city.osm)).to_numpy()}, index=pd.MultiIndex.from_frame(city.osm[KEY]))
     rows = []
@@ -559,38 +567,43 @@ def _per_od(city, routes, names, max_detour_pct):
     base = d[d.algorithm.eq("shortest")].set_index("od_id")
     d = d.join(base[["length_m", "popularity"]].add_prefix("shortest_"), on="od_id")
     d["detour_pct"] = 100 * (d.length_m / d.shortest_length_m - 1)
-    missing, long = d.length_m.isna(), d.detour_pct.gt(max_detour_pct + 1e-9)
-    d["counted"] = np.select([missing, long], [0.0, d.shortest_popularity], d.popularity)
-    d["note"] = np.select([missing, long], ["нет маршрута", f"объезд больше {max_detour_pct}%: в оценку идёт кратчайший"], "")
+    missing = d.length_m.isna()
+    d["counted"] = d.popularity.where(~missing, 0.0)
+    d["note"] = np.where(missing, "нет маршрута", "")
     return d
 
 
 def _table(per_od, solutions):
     base = per_od[per_od.algorithm.eq("shortest")].set_index("od_id").counted
+    comparison = pareto_table(per_od)
     rows = {}
     for name in ["shortest", *solutions]:
         d = per_od[per_od.algorithm.eq(name)].set_index("od_id")
         better = int((d.counted > base.reindex(d.index) + 0.5).sum())
         rows["кратчайший" if name == "shortest" else name] = {
+            "Парето": bool(comparison.loc[name, "Парето"]),
             "популярность": d.counted.mean(),
+            "длина, км": comparison.loc[name, "длина, км"],
+            "маршрутов": f"{comparison.loc[name, 'маршрутов']} из {comparison.loc[name, 'всего пар']}",
             "популярнее кратчайшего": "—" if name == "shortest" else f"{better} из {len(d)}",
             "объезд, %": d.detour_pct.median(),
             "поворотов": d.turns.mean(),
             "неудобные участки, м": d.bad_m.sum(),
             "время поиска, мс": d.search_ms.median(),
         }
-    table = pd.DataFrame(rows).T.sort_values("популярность", ascending=False)
-    digits = {"популярность": 1, "объезд, %": 1, "поворотов": 1, "неудобные участки, м": 0, "время поиска, мс": 2}
-    return table.astype({c: float for c in digits}).round(digits)
+    table = pd.DataFrame(rows).T
+    digits = {"популярность": 1, "длина, км": 3, "объезд, %": 1, "поворотов": 1, "неудобные участки, м": 0, "время поиска, мс": 2}
+    table = table.astype({"Парето": bool, **{c: float for c in digits}})
+    return table.sort_values(["Парето", "длина, км"], ascending=[False, True]).round(digits)
 
 
-def score(city: CityData, solutions: dict, *, network: Network | None = None, max_detour_pct=MAX_DETOUR_PCT,
-          progress: bool = True) -> Result:
+def score(city: CityData, solutions: dict, *, network: Network | None = None, progress: bool = True) -> Result:
     """Route every solution on every OD and compare with the shortest path of the baseline network.
 
     популярность — average over OD of the route popularity 0–100 weighted by length; a road without
-    measurement counts as an average one (50). A route longer than the shortest by more than
-    ``max_detour_pct`` counts as the shortest; no route counts 0.
+    measurement counts as an average one (50). Actual popularity is counted regardless of detour;
+    no route counts 0. The Pareto front maximizes popularity and minimizes mean physical distance,
+    comparing only solutions that found a route for every original OD.
     """
     if "shortest" in solutions:
         raise ValueError("Имя shortest зарезервировано для кратчайшего пути")
@@ -601,7 +614,7 @@ def score(city: CityData, solutions: dict, *, network: Network | None = None, ma
         own = build_routes(network.roads, city.nodes, city.pairs, solutions, cache_dir=cache, progress=progress)
         frames.append(own[own.algorithm.ne("shortest")])
     routes = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), geometry="geometry", crs=city.osm.crs)
-    per_od = _per_od(city, routes, ["shortest", *solutions], max_detour_pct)
+    per_od = _per_od(city, routes, ["shortest", *solutions])
     return Result(_table(per_od, solutions), per_od, routes, solutions, city, network)
 
 

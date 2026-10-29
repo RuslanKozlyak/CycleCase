@@ -515,8 +515,7 @@ def audit_result(result, frozen, network, key, baseline):
             except (KeyError, ZeroDivisionError):
                 flags.append("unknown_edges")
         true_detour = 100 * (length / base.loc[od, "length_m"] - 1)
-        safe_score = 0.0 if row is None or any(flag != "forged_length" for flag in flags) else (
-            float(base.loc[od, "counted"]) if true_detour > 20 + 1e-9 else popularity)
+        safe_score = 0.0 if row is None or any(flag != "forged_length" for flag in flags) else popularity
         official = float(actual.loc[od, "counted"]) if od in actual.index else np.nan
         records.append({"od_id": od, "official": official, "audited": safe_score, "has_route": row is not None,
                         "true_length_m": length, "true_detour_pct": true_detour, "flags": ";".join(flags)})
@@ -565,7 +564,7 @@ def worker(bundle_path, case_id, out, fresh_cache=False):
                        search_ms=float(actual.search_ms.median()), detour_pct=float(actual.detour_pct.median()),
                        unsafe_m=float(actual.bad_m.sum()), coverage_pct=float(actual.coverage_pct.mean()),
                        flags=issues, valid_paths=int(detail["flags"].eq("").sum()),
-                       over_budget=int(detail.true_detour_pct.gt(20 + 1e-9).sum()))
+                       detours_over_20_pct=int(detail.true_detour_pct.gt(20 + 1e-9).sum()))
             detail.to_csv(out / f"{case.id}_{zone}_audit.csv", index=False)
             result.per_od.to_pickle(out / f"{case.id}_{zone}_per_od.pkl")
             own.to_pickle(out / f"{case.id}_{zone}_routes.pkl")
@@ -963,7 +962,7 @@ def report(cases, records, out):
                           "open": scores.loc[ident, "open"], "closed": scores.loc[ident, "closed"],
                           "audit_flags": ";".join(issues), "closed_audited": detail.audited.mean(),
                           "failed_closed": int((~detail.has_route).sum()),
-                          "over_budget_closed": int(detail.true_detour_pct.gt(20 + 1e-9).sum()),
+                          "detours_over_20_pct_closed": int(detail.true_detour_pct.gt(20 + 1e-9).sum()),
                           "unsafe_m": float(zone_rows[zone_rows.zone.eq("closed")].unsafe_m.iloc[0]),
                           "search_ms": float(zone_rows[zone_rows.zone.eq("closed")].search_ms.iloc[0])})
         if not issues:
@@ -1091,7 +1090,7 @@ def report(cases, records, out):
                 lines += ["Фактические заезды в нефинишные тупики в собственной сети решения (повторные узлы означают возврат/петлю, сами по себе не нарушение):", "", "```", entered.to_string(index=False), "```", ""]
     if len(leaderboard):
         lines += ["## Семейства решений", "", "```", pd.read_csv(out / "families.csv").round(2).to_string(index=False), "```", "",
-                  "## Разница с кратчайшим", "", "```", leaderboard.sort_values("closed", ascending=False).head(15)[["label", "gain_vs_baseline", "gain_ci90_low", "gain_ci90_high", "over_budget_closed"]].round(2).to_string(), "```", "",
+                  "## Разница с кратчайшим", "", "Число объездов >20% приведено справочно, штрафа или подмены популярности нет.", "", "```", leaderboard.sort_values("closed", ascending=False).head(15)[["label", "gain_vs_baseline", "gain_ci90_low", "gain_ci90_high", "detours_over_20_pct_closed"]].round(2).to_string(), "```", "",
                   "Даже при парном bootstrap OD могут зависеть друг от друга через общие дороги. Ярусы текущего grader — эвристика сравнения, а не доказательство единственного победителя. "
                   "Допуск небезопасных дорог сейчас не является условием исключения: unsafe_m только показывается. Это правило нужно определить до соревнования.", ""]
         if "H080" in leaderboard.index:

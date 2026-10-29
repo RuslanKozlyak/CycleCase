@@ -108,7 +108,7 @@ def test_public_pack_hides_closed_zone_but_marks_it(city):
         load_city(data.folder)
 
 
-def test_score_compares_with_shortest_and_applies_detour_rule(city):
+def test_score_counts_actual_popularity_even_for_long_detours(city):
     data, _ = city
     result = score(data, {"bike": bike()})
     table, per_od = result.table, result.per_od.set_index("algorithm")
@@ -116,9 +116,15 @@ def test_score_compares_with_shortest_and_applies_detour_rule(city):
     assert table.loc["bike", "популярнее кратчайшего"] == "1 из 1"
     assert table.loc["кратчайший", "объезд, %"] == 0
     assert per_od.loc["bike", "search_ms"] >= 0
-    strict = score(data, {"bike": bike()}, max_detour_pct=1).per_od.set_index("algorithm")
-    assert strict.loc["bike", "counted"] == strict.loc["shortest", "counted"]
-    assert "в оценку идёт кратчайший" in strict.loc["bike", "note"]
+    north = has_any(data.osm.highway, "cycleway")
+    longer = replace(data, osm=data.osm.assign(length_m=data.osm.length_m.where(~north, data.osm.length_m * 4)))
+    actual = score(longer, {"bike": bike()})
+    long_route = actual.per_od.set_index("algorithm").loc["bike"]
+    assert long_route.detour_pct > 20
+    assert long_route.counted == long_route.popularity and long_route.note == ""
+    assert long_route.counted > actual.per_od.set_index("algorithm").loc["shortest", "counted"]
+    assert actual.pareto.loc["bike", "Парето"] and actual.pareto.loc["кратчайший", "Парето"]
+    actual.plot_pareto()
 
 
 def test_unmeasured_roads_count_as_average(city):
@@ -157,8 +163,10 @@ def test_filter_without_route_counts_zero(city):
     data, _ = city
     network = build_network(data, lambda roads: rideable(roads) & roads["тип_дороги"].eq("велодорожка"))
     assert "Без маршрута останутся пары: 1" in network.summary()
-    per_od = score(data, {"bike": bike()}, network=network).per_od.set_index("algorithm")
+    result = score(data, {"bike": bike()}, network=network)
+    per_od = result.per_od.set_index("algorithm")
     assert per_od.loc["bike", "counted"] == 0 and per_od.loc["bike", "note"] == "нет маршрута"
+    assert not result.pareto.loc["bike", "Парето"] and pd.isna(result.pareto.loc["bike", "длина, км"])
     with pytest.raises(ValueError, match="True/False"):
         build_network(data, lambda roads: roads["длина_м"])
 

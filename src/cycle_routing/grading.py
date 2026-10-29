@@ -2,8 +2,8 @@
 
 A submission is the folder written by ``export_solution`` (``submission.json`` + ``solution.pkl``) or a ZIP of it.
 Loading a submission runs the team's code, so open only solutions from participants.
-Close scores are not ranked apart: tiers group teams whose difference from the tier's best is within the noise of
-the closed pairs (paired bootstrap over pairs, 90%).
+The Pareto front maximizes actual popularity and minimizes mean physical distance on all closed OD.
+Popularity-only tiers and 90% paired bootstrap intervals remain descriptive statistics.
 """
 
 from __future__ import annotations
@@ -20,9 +20,10 @@ import pandas as pd
 from tqdm import tqdm
 
 from .workshop import CityData, Result, build_network, closed_city, load_submission, score
+from .pareto import pareto_table
 
 BOOTS = 2000
-COLUMNS = ["популярность", "популярнее кратчайшего", "объезд, %", "поворотов", "неудобные участки, м",
+COLUMNS = ["Парето", "популярность", "длина, км", "маршрутов", "популярнее кратчайшего", "объезд, %", "поворотов", "неудобные участки, м",
            "время поиска, мс", "открытая зона"]
 
 
@@ -100,6 +101,16 @@ class Leaderboard:
     result: Result
     intervals: pd.DataFrame = field(default_factory=pd.DataFrame)
 
+    @property
+    def pareto(self):
+        if self.result is None:
+            return pareto_table(pd.DataFrame(columns=["algorithm", "od_id", "length_m", "popularity"]))
+        return self.result.pareto
+
+    def plot_pareto(self):
+        from .pareto import plot_pareto
+        return plot_pareto(self.pareto, title="Решения команд: закрытая зона")
+
     def plot(self):
         """Each team's popularity minus the shortest path, with its 90% interval."""
         import matplotlib.pyplot as plt
@@ -148,16 +159,17 @@ def grade_all(city: CityData, private_folder, submissions: list[Submission], *, 
     boots = bootstrap(per_od, names, np.random.default_rng(seed))
     labels = ["кратчайший", *solutions]
     table = pd.DataFrame(rows).T.loc[labels, [c for c in COLUMNS if c != "открытая зона" or with_open]]
-    for column in table.columns.drop("популярнее кратчайшего"):
+    for column in table.columns.drop(["популярнее кратчайшего", "Парето", "маршрутов"]):
         table[column] = pd.to_numeric(table[column])
-    table.insert(0, "ярус", tiers(pd.Series(per_od.groupby("algorithm").counted.mean()[names].to_numpy(), index=labels), boots))
+    table["Парето"] = pareto_table(per_od, dict(zip(names, labels)))["Парето"].reindex(table.index)
+    table.insert(2, "ярус популярности", tiers(pd.Series(per_od.groupby("algorithm").counted.mean()[names].to_numpy(), index=labels), boots))
     spread = pd.Series((np.percentile(boots, 95, axis=0) - np.percentile(boots, 5, axis=0)) / 2, index=labels)
     table.insert(2, "±", spread.round(1))
     if with_open:
-        table.insert(3, "популярность, открытая зона", table.pop("открытая зона").round(1))
+        table.insert(4, "популярность, открытая зона", table.pop("открытая зона").round(1))
     difference = boots - boots[:, [0]]
     intervals = pd.DataFrame({"разница": difference.mean(axis=0), "от": np.percentile(difference, 5, axis=0),
                               "до": np.percentile(difference, 95, axis=0)}, index=labels).drop(index="кратчайший")
-    table = (table.sort_values(["ярус", "популярность"], ascending=[True, False])
+    table = (table.sort_values(["Парето", "длина, км"], ascending=[False, True])
              .rename(columns={"популярность": "популярность, закрытая зона"}))
     return Leaderboard(table, errors, Result(table, per_od, routes, solutions, closed, None), intervals)

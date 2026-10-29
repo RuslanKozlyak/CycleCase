@@ -26,6 +26,9 @@ def main():
     print(submissions_table(teams).to_string())
     board = grade_all(city, ROOT/"outputs/hackathon_private"/args.pack, teams)
     board.table.to_csv(args.submissions/"leaderboard.csv")
+    board.pareto.to_csv(args.submissions/"pareto.csv")
+    if board.result is not None:
+        board.plot_pareto().savefig(args.submissions/"pareto.png", dpi=160)
     print("\n" + board.table.to_string())
     if len(board.errors):
         print("\n" + board.errors.to_string())
