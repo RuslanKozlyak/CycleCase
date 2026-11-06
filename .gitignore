@@ -51,6 +51,9 @@ notebooks/data/hackathon/*/*
 !notebooks/data/hackathon/saint_petersburg/pairs.parquet
 !notebooks/data/hackathon/saint_petersburg/labels.parquet
 !notebooks/data/hackathon/saint_petersburg/tracks.parquet
+!notebooks/data/hackathon/saint_petersburg/gpx/
+notebooks/data/hackathon/saint_petersburg/gpx/*
+!notebooks/data/hackathon/saint_petersburg/gpx/*.gpx
 !notebooks/data/hackathon/saint_petersburg/points/
 notebooks/data/hackathon/saint_petersburg/points/*
 !notebooks/data/hackathon/saint_petersburg/points/manifest.json
