@@ -1,0 +1,64 @@
+# Python and local environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Local work and organizer materials
+outputs/
+.tmp/
+.test-tmp/
+graphify-out/
+.vscode/
+.idea/
+.agents/
+.codex/
+AGENTS.md
+tests/
+tools/
+docs/
+deployment/
+/*.md
+!/README.md
+!/LIBRARIES_CHEATSHEET.md
+.dockerignore
+notebooks/_to delete/
+notebooks/hackathon_grading.ipynb
+
+# Data: keep only the two prepared public datasets
+notebooks/data/*
+!notebooks/data/hackathon/
+notebooks/data/hackathon/*
+!notebooks/data/hackathon/konstanz/
+!notebooks/data/hackathon/saint_petersburg/
+notebooks/data/hackathon/*/*
+!notebooks/data/hackathon/konstanz/manifest.json
+!notebooks/data/hackathon/konstanz/roads.parquet
+!notebooks/data/hackathon/konstanz/nodes.parquet
+!notebooks/data/hackathon/konstanz/pairs.parquet
+!notebooks/data/hackathon/konstanz/labels.parquet
+!notebooks/data/hackathon/konstanz/test_area.parquet
+!notebooks/data/hackathon/konstanz/points/
+!notebooks/data/hackathon/saint_petersburg/manifest.json
+!notebooks/data/hackathon/saint_petersburg/roads.parquet
+!notebooks/data/hackathon/saint_petersburg/nodes.parquet
+!notebooks/data/hackathon/saint_petersburg/pairs.parquet
+!notebooks/data/hackathon/saint_petersburg/labels.parquet
+!notebooks/data/hackathon/saint_petersburg/tracks.parquet
+!notebooks/data/hackathon/saint_petersburg/points/
+notebooks/data/hackathon/saint_petersburg/points/*
+!notebooks/data/hackathon/saint_petersburg/points/manifest.json
+!notebooks/data/hackathon/saint_petersburg/points/points.parquet
+notebooks/data/hackathon/konstanz/points/*
+!notebooks/data/hackathon/konstanz/points/manifest.json
+!notebooks/data/hackathon/konstanz/points/points.parquet
+
+# Generated maps
+*.html
+!src/cycle_routing/assets/*.html

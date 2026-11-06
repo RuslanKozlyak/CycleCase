@@ -1,0 +1,17 @@
+{
+  "format_version": 2,
+  "dataset_id": "70bb5d43ba26564a",
+  "city": "konstanz",
+  "files": {
+    "roads.parquet": "404669d38c046822c490d0619c6ef3d232e2469ae4ce00ce1f8c63fa2950272c",
+    "nodes.parquet": "fd066d04006bcabc217f474db56b4cbcdb9e789660f6bcb9debf1cd6abe64db3",
+    "pairs.parquet": "b0e2cea317e853c3836550159fd5ff9454a93851a396fc3c1c9e4844ec7d09ee",
+    "labels.parquet": "cc8be219522f9b7498a57abcf793173fb2565e20ca7317b65ba4847a0f89db86",
+    "test_area.parquet": "01f5fb020cc4cb6e1d0e3f056e36525b72d77140cda0522aee06b48e262b88dc"
+  },
+  "roads": 44460,
+  "nodes": 16976,
+  "open_pairs": 36,
+  "open_labels": 9447,
+  "label_policy": "NaN = no measurement; explicit zero kept; closed-zone labels withheld"
+}

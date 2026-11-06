@@ -1,0 +1,37 @@
+{
+  "format_version": 1,
+  "categories": [
+    "ворота",
+    "столбики и ограждения",
+    "светофоры",
+    "переходы",
+    "переезды",
+    "остановки",
+    "питьевая вода",
+    "ремонт",
+    "велопарковки"
+  ],
+  "source": "OpenStreetMap API extracts and Overpass snapshot",
+  "complete": false,
+  "sha256": "3c766231f5bab077555995121f27da485cab5ac9bdb7862edace916bf156281d",
+  "license": "ODbL-1.0",
+  "source_url": "https://www.openstreetmap.org/copyright",
+  "endpoint": "OpenStreetMap API cached map extracts + prepared Overpass snapshot",
+  "bounds": [
+    30.196728090132293,
+    59.91796089117215,
+    30.446269254554085,
+    60.030607215689614
+  ],
+  "query_key": "06cac6fd68394abf59a6cc210ffe01755879ca7bd5ea7d93273464093f0f3c8f",
+  "network_key": "a4c288eee5f60b6cbf77a6accd7da3c09ebfebd80124ae371a302b22131e39d2",
+  "point_buffer_m": 500.0,
+  "downloaded": 30232,
+  "scope": "Points within the buffer of the prepared road network",
+  "representation": "OSM node coordinates; centers for ways and relations",
+  "osm_timestamp": "2026-11-02T00:00:00Z",
+  "source_dates": {
+    "islands": "2026-11-02",
+    "existing_area": "2026-11-06"
+  }
+}
