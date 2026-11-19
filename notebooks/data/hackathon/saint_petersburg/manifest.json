@@ -1,0 +1,22 @@
+{
+  "format_version": 2,
+  "dataset_id": "6be3518471ccdcbe",
+  "city": "saint_petersburg",
+  "files": {
+    "roads.parquet": "9d8dbdc80a2926b4a29ce505ecacfaf88789d0db6904dc1ed186ff4c2d64a386",
+    "nodes.parquet": "fada2d11e2bab857cb88595ab40af80d64a86b6cdf86504fed9cce3e121e7b0f",
+    "pairs.parquet": "62b7cf65b6f27871a77025d82754730b1b45a569b57e9e38bfa3c53ee10c4336",
+    "labels.parquet": "d368fbf9db080ab67cbd38d3df802806b5c4f8fc942d56b5f554637b34edc748",
+    "tracks.parquet": "d8fe62ca8492eb15f4cc42723944567128534b7c64047c1bb0b2943bab96f523"
+  },
+  "roads": 161115,
+  "nodes": 57131,
+  "open_pairs": 1,
+  "open_labels": 4223,
+  "label_policy": "NaN = no measurement; explicit zero kept; closed-zone labels withheld",
+  "coverage": {
+    "gpx_buffer_m": 500,
+    "district_osm_relation": 1114905,
+    "policy": "Existing network plus full Petrogradsky district and cleaned GPX corridors"
+  }
+}
